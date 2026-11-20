@@ -1,0 +1,1636 @@
+<!DOCTYPE html>
+<!--
+=============================================================================
+ WISHLIST MANAGER  -  single-file app (HTML + CSS + JS)
+=============================================================================
+
+PROJECT SUMMARY
+  A personal, shareable wishlist / purchase planner. No login, no backend.
+  Static page (GitHub Pages) + Cloud Firestore (Web SDK v10 modular, live
+  onSnapshot + offline cache). Plan short/long-term purchases in "groups"
+  (3 Months, 1 Year, House, PC Build, Dream ...), with categories, custom
+  fields, manual prices + price history, dashboard, budget planner, backups
+  (xlsx/csv/json), view-only share link (?view=1), bn/en UI, light/dark theme.
+  DATA is only in Firestore. localStorage is used ONLY for theme + language.
+
+FULL SCHEMA (Firestore)  -  schemaVersion 1
+  meta/app        : { schemaVersion:number(1), currencySymbol:string, siteTitle:string }
+  groups/{id}     : { name, icon, color, order:number,
+                      fieldDefs:[{key,label,type,options:[]}],   // type: text|number|date|select|checkbox|url
+                      createdAt, updatedAt }
+  categories/{id} : { groupId, name, order:number, createdAt, updatedAt }
+  items/{id}      : { groupId, categoryId(""=none), name, productLink, imageUrl,
+                      price:number, quantity:number(default 1),
+                      priority:"high|medium|low", status:"want|bought|skipped",
+                      targetDate:"YYYY-MM-DD" or "", description, notes,
+                      custom:{[fieldKey]:value}, priceHistory:[{date,price}],
+                      boughtAt, createdAt, updatedAt }
+  Timestamps use serverTimestamp(). Custom values are stored by stable field
+  `key` (never by label) so renaming a label never loses data.
+
+HOW TO EXTEND (rules for humans and AIs)
+  1. Backward compatible ONLY: new features may ADD optional fields. Never
+     rename/remove existing fields or collections.
+  2. Every read goes through normGroup / normCategory / normItem (safe defaults).
+     When you add a field, add its default there too.
+  3. Every Firestore call lives in the "DB LAYER" section as a small function.
+     UI code must never call Firestore directly.
+  4. All UI text lives in I18N (bn + en). Add keys to BOTH languages.
+  5. Never put user text into innerHTML. Use el() / textContent. Links and
+     images must pass safeUrl() (http/https only).
+  6. Wrap Firestore actions with run() so errors become toasts.
+  7. If you add a field to Firestore, also update firestore.rules validation
+     (optional-field style) and the export/import functions.
+
+CHANGELOG
+  1.0.0  Initial release: groups, categories, custom fields, items, image
+         preview, price history, detail view, dashboard, search/filter/sort,
+         budget planner, xlsx/csv/json export, json import (merge/replace),
+         print CSS, settings, i18n bn/en, view-only mode, dark mode.
+=============================================================================
+-->
+<html lang="bn" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>Wishlist Manager</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
+
+<script type="module">
+/* =============================================================================
+   CONFIG
+   ============================================================================= */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCRiZ3EtqnbpvkzwC82wTCpMY16bcLpUsQ",
+  authDomain: "wish-list-b577a.firebaseapp.com",
+  projectId: "wish-list-b577a",
+  storageBucket: "wish-list-b577a.firebasestorage.app",
+  messagingSenderId: "521983182154",
+  appId: "1:521983182154:web:c30aee971d167a5ebaedb3",
+  measurementId: "G-SDDKH6794D"
+};
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import {
+  getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+  collection, doc, addDoc, setDoc, updateDoc, deleteDoc, getDocs, onSnapshot,
+  query, where, writeBatch, serverTimestamp, Timestamp
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const SCHEMA_VERSION = 1;
+const DEFAULT_SETTINGS = { siteTitle: "My Wishlist", currencySymbol: "৳" };
+const VIEW_ONLY = new URLSearchParams(location.search).get("view") === "1";
+const BATCH_LIMIT = 400;                       // Firestore max is 500 per batch
+const PRIORITIES = ["high", "medium", "low"];
+const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
+const STATUSES = ["want", "bought", "skipped"];
+const FIELD_TYPES = ["text", "number", "date", "select", "checkbox", "url"];
+const DEFAULT_COLOR = "#6366f1";
+const COLOR_PRESETS = ["#6366f1", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#ec4899", "#8b5cf6", "#64748b"];
+const EMOJI_CHOICES = ["🎯", "🛒", "🏠", "💻", "🚗", "🏍️", "✈️", "📱", "🎮", "👟", "📚", "💎", "🎁", "⭐"];
+const SAMPLE_GROUPS = [
+  { name: "3 Months", icon: "🗓️", color: "#0ea5e9" },
+  { name: "1 Year",   icon: "📅", color: "#10b981" },
+  { name: "3 Years",  icon: "🎯", color: "#f59e0b" },
+  { name: "House",    icon: "🏠", color: "#8b5cf6" },
+  { name: "PC Build", icon: "💻", color: "#6366f1" },
+  { name: "Dream",    icon: "🚗", color: "#ec4899" }
+];
+
+function isConfigured() {
+  const c = FIREBASE_CONFIG || {};
+  const bad = (v) => !v || /PASTE/i.test(String(v));
+  return !bad(c.apiKey) && !bad(c.projectId) && !bad(c.appId);
+}
+
+/* =============================================================================
+   I18N  (every UI string lives here; add keys to BOTH languages)
+   ============================================================================= */
+const I18N = {
+  en: {
+    viewOnly: "View only", setupTitle: "Setup needed",
+    setupBody: "Paste your Firebase web config into FIREBASE_CONFIG at the top of index.html, then reload.",
+    dbErrorTitle: "Cannot reach the database",
+    dbErrorHint: "Make sure Firestore is created and firestore.rules is published.",
+    budget: "Budget", backup: "Backup", settings: "Settings", print: "Print / PDF",
+    themeLight: "Light", themeDark: "Dark", theme: "Theme", language: "Language",
+    dashTotal: "Estimated total", dashRemaining: "Remaining", dashBought: "Bought", dashItems: "Items",
+    dashNote: "Skipped items are not counted", dashPerGroup: "Per group",
+    all: "All", addGroup: "Group", editGroup: "Edit group", deleteGroup: "Delete group",
+    categories: "Categories", customFields: "Custom fields", addItem: "Add item", editItem: "Edit item",
+    searchPh: "Search by name…", allCategories: "All categories", uncategorized: "Uncategorized",
+    allStatuses: "All statuses", allPriorities: "All priorities", reset: "Reset",
+    sortNewest: "Newest", sortPriceHigh: "Price: high → low", sortPriceLow: "Price: low → high",
+    sortName: "Name A–Z", sortPriority: "Priority", showing: "Showing {n} of {total}",
+    want: "Want", bought: "Bought", skipped: "Skipped",
+    high: "High", medium: "Medium", low: "Low",
+    emptyNoGroupsTitle: "Your wishlist is empty", emptyNoGroupsText: "Create a group (like “3 Months” or “PC Build”) to start planning.",
+    addSampleGroups: "Add sample groups", createGroup: "Create group",
+    emptyNoItemsTitle: "No items yet", emptyNoItemsText: "Add your first item to this list.",
+    emptyViewOnly: "Nothing to show here yet.", emptyNoMatch: "No items match your filters.",
+    groupName: "Group name", icon: "Icon", color: "Color",
+    save: "Save", cancel: "Cancel", delete: "Delete", edit: "Edit", duplicate: "Duplicate", close: "Close",
+    add: "Add", rename: "Rename",
+    confirmDeleteGroupTitle: "Delete group?",
+    confirmDeleteGroupMsg: "“{name}” will be deleted together with {items} item(s) and {cats} categorie(s). This cannot be undone.",
+    confirmDeleteCatTitle: "Delete category?",
+    confirmDeleteCatMsg: "“{name}” will be deleted. Its {items} item(s) will become uncategorized.",
+    confirmDeleteItemTitle: "Delete item?", confirmDeleteItemMsg: "“{name}” will be permanently deleted.",
+    confirmDeleteFieldMsg: "Remove this field definition? Existing values stay in the items but will be hidden.",
+    categoryName: "Category name", newCategory: "New category", noCategories: "No categories yet.",
+    fieldLabel: "Label", fieldType: "Type", fieldOptions: "Options (comma separated)",
+    addField: "Add field", fieldsHint: "Renaming a label keeps all existing data. Fields appear in the item form, cards, details and exports.",
+    noFields: "No custom fields yet.",
+    type_text: "Text", type_number: "Number", type_date: "Date", type_select: "Select", type_checkbox: "Checkbox", type_url: "Link",
+    itemName: "Item name", group: "Group", category: "Category", price: "Price", quantity: "Quantity",
+    priority: "Priority", status: "Status", targetDate: "Target date", productLink: "Product link",
+    imageUrl: "Image URL", description: "Description", notes: "Notes", imagePreview: "Image preview",
+    imageFail: "Image could not be loaded", total: "Total", openProduct: "Open product page",
+    markBought: "Mark as bought", markWant: "Back to wanted", priceHistory: "Price history", noHistory: "No price changes yet.",
+    createdOn: "Added", boughtOn: "Bought on", yes: "Yes", no: "No", copySuffix: "(copy)", none: "None",
+    budgetTitle: "Budget planner", budgetMoney: "Money I have now", budgetGroup: "Group",
+    budgetPlan: "What you can buy", budgetSpent: "Planned spend", budgetLeft: "Money left",
+    budgetNot: "Not affordable yet", budgetNeeds: "needs {amount} more", budgetEmpty: "No wanted items to plan.",
+    budgetHint: "Order: high priority first, then lower price first.", budgetNone: "Nothing fits this budget yet.",
+    colName: "Item", colPrice: "Cost", colRunning: "Running total", colLeft: "Left",
+    backupTitle: "Backup & export", exportSection: "Export", importSection: "Import (restore)",
+    exportXlsx: "Excel (.xlsx)", exportCsv: "CSV (items)", exportJson: "Full JSON backup",
+    importJson: "Import JSON", importMode: "Import mode", importMerge: "Merge (add / overwrite same IDs)",
+    importReplace: "Replace all (delete current data first)", importChoose: "Choose a JSON backup file",
+    importConfirmTitle: "Import backup?",
+    importConfirmMsg: "File contains {groups} group(s), {cats} categorie(s), {items} item(s). Mode: {mode}.",
+    importReplaceWarn: "ALL current data will be deleted first!", importInvalid: "This is not a valid Wishlist backup file.",
+    settingsTitle: "Settings", siteTitle: "Site title", currency: "Currency symbol",
+    toastSaved: "Saved", toastDeleted: "Deleted", toastCreated: "Created", toastBought: "Marked as bought",
+    toastExported: "Exported", toastImported: "Import finished", toastSampleAdded: "Sample groups added",
+    toastQueued: "Saved on this device, will sync when online", toastOffline: "You are offline", toastOnline: "Back online",
+    errGeneric: "Something went wrong", needGroup: "Create a group first", nameRequired: "Name is required",
+    priceInvalid: "Price must be 0 or more", qtyInvalid: "Quantity must be at least 1", badUrl: "Links must start with http:// or https://",
+    xlsxMissing: "Excel library failed to load. Check your connection.", fieldLabelRequired: "Every field needs a label",
+    fieldOptionsRequired: "Select fields need at least one option", sampleExists: "Sample groups already exist"
+  },
+  bn: {
+    viewOnly: "শুধু দেখা", setupTitle: "সেটআপ দরকার",
+    setupBody: "index.html ফাইলের উপরে FIREBASE_CONFIG-এ আপনার Firebase কনফিগ বসান, তারপর পেজ রিলোড করুন।",
+    dbErrorTitle: "ডাটাবেসে সংযোগ হচ্ছে না",
+    dbErrorHint: "Firestore তৈরি আছে কিনা এবং firestore.rules পাবলিশ করা হয়েছে কিনা দেখুন।",
+    budget: "বাজেট", backup: "ব্যাকআপ", settings: "সেটিংস", print: "প্রিন্ট / PDF",
+    themeLight: "লাইট", themeDark: "ডার্ক", theme: "থিম", language: "ভাষা",
+    dashTotal: "আনুমানিক মোট", dashRemaining: "বাকি", dashBought: "কেনা হয়েছে", dashItems: "আইটেম",
+    dashNote: "বাদ দেওয়া আইটেম হিসাবে ধরা হয়নি", dashPerGroup: "গ্রুপ অনুযায়ী",
+    all: "সব", addGroup: "গ্রুপ", editGroup: "গ্রুপ এডিট", deleteGroup: "গ্রুপ ডিলিট",
+    categories: "ক্যাটাগরি", customFields: "কাস্টম ফিল্ড", addItem: "আইটেম যোগ", editItem: "আইটেম এডিট",
+    searchPh: "নাম দিয়ে খুঁজুন…", allCategories: "সব ক্যাটাগরি", uncategorized: "ক্যাটাগরি ছাড়া",
+    allStatuses: "সব স্ট্যাটাস", allPriorities: "সব অগ্রাধিকার", reset: "রিসেট",
+    sortNewest: "নতুন আগে", sortPriceHigh: "দাম: বেশি → কম", sortPriceLow: "দাম: কম → বেশি",
+    sortName: "নাম A–Z", sortPriority: "অগ্রাধিকার", showing: "{total}টির মধ্যে {n}টি দেখাচ্ছে",
+    want: "চাই", bought: "কেনা হয়েছে", skipped: "বাদ",
+    high: "উচ্চ", medium: "মাঝারি", low: "কম",
+    emptyNoGroupsTitle: "আপনার উইশলিস্ট খালি", emptyNoGroupsText: "পরিকল্পনা শুরু করতে একটি গ্রুপ বানান (যেমন “৩ মাস” বা “PC Build”)।",
+    addSampleGroups: "নমুনা গ্রুপ যোগ করুন", createGroup: "গ্রুপ বানান",
+    emptyNoItemsTitle: "এখনো কোনো আইটেম নেই", emptyNoItemsText: "এই লিস্টে প্রথম আইটেম যোগ করুন।",
+    emptyViewOnly: "এখানে দেখানোর মতো কিছু নেই।", emptyNoMatch: "ফিল্টারের সাথে কোনো আইটেম মেলেনি।",
+    groupName: "গ্রুপের নাম", icon: "আইকন", color: "রং",
+    save: "সেভ", cancel: "বাতিল", delete: "ডিলিট", edit: "এডিট", duplicate: "কপি", close: "বন্ধ",
+    add: "যোগ", rename: "নাম বদল",
+    confirmDeleteGroupTitle: "গ্রুপ ডিলিট করবেন?",
+    confirmDeleteGroupMsg: "“{name}” গ্রুপের সাথে {items}টি আইটেম ও {cats}টি ক্যাটাগরি মুছে যাবে। এটি ফেরানো যাবে না।",
+    confirmDeleteCatTitle: "ক্যাটাগরি ডিলিট করবেন?",
+    confirmDeleteCatMsg: "“{name}” মুছে যাবে। এর {items}টি আইটেম ক্যাটাগরি ছাড়া হয়ে যাবে।",
+    confirmDeleteItemTitle: "আইটেম ডিলিট করবেন?", confirmDeleteItemMsg: "“{name}” স্থায়ীভাবে মুছে যাবে।",
+    confirmDeleteFieldMsg: "এই ফিল্ডটি সরাবেন? আগের ডাটা আইটেমে থাকবে কিন্তু দেখা যাবে না।",
+    categoryName: "ক্যাটাগরির নাম", newCategory: "নতুন ক্যাটাগরি", noCategories: "এখনো কোনো ক্যাটাগরি নেই।",
+    fieldLabel: "লেবেল", fieldType: "ধরন", fieldOptions: "অপশন (কমা দিয়ে আলাদা করুন)",
+    addField: "ফিল্ড যোগ", fieldsHint: "লেবেলের নাম বদলালেও আগের ডাটা থাকবে। ফিল্ডগুলো ফর্ম, কার্ড, ডিটেইল ও এক্সপোর্টে দেখা যাবে।",
+    noFields: "এখনো কোনো কাস্টম ফিল্ড নেই।",
+    type_text: "লেখা", type_number: "সংখ্যা", type_date: "তারিখ", type_select: "সিলেক্ট", type_checkbox: "চেকবক্স", type_url: "লিংক",
+    itemName: "আইটেমের নাম", group: "গ্রুপ", category: "ক্যাটাগরি", price: "দাম", quantity: "পরিমাণ",
+    priority: "অগ্রাধিকার", status: "স্ট্যাটাস", targetDate: "লক্ষ্য তারিখ", productLink: "প্রোডাক্ট লিংক",
+    imageUrl: "ছবির লিংক", description: "বিবরণ", notes: "নোট", imagePreview: "ছবির প্রিভিউ",
+    imageFail: "ছবি লোড হয়নি", total: "মোট", openProduct: "প্রোডাক্ট পেজ খুলুন",
+    markBought: "কেনা হয়েছে চিহ্নিত করুন", markWant: "আবার ‘চাই’-এ নিন", priceHistory: "দামের ইতিহাস", noHistory: "এখনো দাম বদলায়নি।",
+    createdOn: "যোগ হয়েছে", boughtOn: "কেনার তারিখ", yes: "হ্যাঁ", no: "না", copySuffix: "(কপি)", none: "নেই",
+    budgetTitle: "বাজেট প্ল্যানার", budgetMoney: "এখন আমার কাছে টাকা আছে", budgetGroup: "গ্রুপ",
+    budgetPlan: "যা কিনতে পারবেন", budgetSpent: "পরিকল্পিত খরচ", budgetLeft: "বাকি টাকা",
+    budgetNot: "এখনো কেনা সম্ভব নয়", budgetNeeds: "আরও {amount} লাগবে", budgetEmpty: "পরিকল্পনা করার মতো ‘চাই’ আইটেম নেই।",
+    budgetHint: "ক্রম: আগে উচ্চ অগ্রাধিকার, তারপর কম দাম।", budgetNone: "এই বাজেটে এখনো কিছু হচ্ছে না।",
+    colName: "আইটেম", colPrice: "খরচ", colRunning: "চলমান মোট", colLeft: "বাকি",
+    backupTitle: "ব্যাকআপ ও এক্সপোর্ট", exportSection: "এক্সপোর্ট", importSection: "ইমপোর্ট (রিস্টোর)",
+    exportXlsx: "Excel (.xlsx)", exportCsv: "CSV (আইটেম)", exportJson: "সম্পূর্ণ JSON ব্যাকআপ",
+    importJson: "JSON ইমপোর্ট", importMode: "ইমপোর্ট মোড", importMerge: "মার্জ (একই ID থাকলে ওভাররাইট)",
+    importReplace: "সব প্রতিস্থাপন (আগে বর্তমান ডাটা মুছবে)", importChoose: "একটি JSON ব্যাকআপ ফাইল বাছুন",
+    importConfirmTitle: "ব্যাকআপ ইমপোর্ট করবেন?",
+    importConfirmMsg: "ফাইলে আছে {groups}টি গ্রুপ, {cats}টি ক্যাটাগরি, {items}টি আইটেম। মোড: {mode}।",
+    importReplaceWarn: "আগে বর্তমান সব ডাটা মুছে ফেলা হবে!", importInvalid: "এটি সঠিক Wishlist ব্যাকআপ ফাইল নয়।",
+    settingsTitle: "সেটিংস", siteTitle: "সাইটের নাম", currency: "মুদ্রার চিহ্ন",
+    toastSaved: "সেভ হয়েছে", toastDeleted: "মুছে গেছে", toastCreated: "তৈরি হয়েছে", toastBought: "কেনা হয়েছে চিহ্নিত",
+    toastExported: "এক্সপোর্ট হয়েছে", toastImported: "ইমপোর্ট শেষ", toastSampleAdded: "নমুনা গ্রুপ যোগ হয়েছে",
+    toastQueued: "এই ডিভাইসে সেভ হয়েছে, অনলাইনে এলে সিঙ্ক হবে", toastOffline: "আপনি অফলাইনে", toastOnline: "আবার অনলাইনে",
+    errGeneric: "কিছু একটা সমস্যা হয়েছে", needGroup: "আগে একটি গ্রুপ বানান", nameRequired: "নাম দিতে হবে",
+    priceInvalid: "দাম ০ বা তার বেশি হতে হবে", qtyInvalid: "পরিমাণ কমপক্ষে ১ হতে হবে", badUrl: "লিংক http:// বা https:// দিয়ে শুরু হতে হবে",
+    xlsxMissing: "Excel লাইব্রেরি লোড হয়নি। ইন্টারনেট দেখুন।", fieldLabelRequired: "প্রতিটি ফিল্ডে লেবেল লাগবে",
+    fieldOptionsRequired: "সিলেক্ট ফিল্ডে কমপক্ষে একটি অপশন দিন", sampleExists: "নমুনা গ্রুপ আগে থেকেই আছে"
+  }
+};
+
+function t(key, vars) {
+  let s = (I18N[state.lang] && I18N[state.lang][key]);
+  if (s === undefined) s = I18N.en[key];
+  if (s === undefined) s = key;
+  if (vars) for (const [k, v] of Object.entries(vars)) s = s.split("{" + k + "}").join(String(v));
+  return s;
+}
+
+/* =============================================================================
+   STATE
+   ============================================================================= */
+function lsGet(k, fallback) { try { return localStorage.getItem(k) ?? fallback; } catch { return fallback; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch { /* ignore */ } }
+
+const state = {
+  settings: { ...DEFAULT_SETTINGS },
+  groups: [], categories: [], items: [],
+  loaded: { meta: false, groups: false, categories: false, items: false },
+  dbError: "",
+  ui: { groupId: "all", search: "", categoryId: "all", status: "all", priority: "all", sort: "newest" },
+  budget: { money: "", groupId: "all" },
+  lang: lsGet("wl_lang", "bn"),
+  theme: lsGet("wl_theme", (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light")
+};
+const allLoaded = () => Object.values(state.loaded).every(Boolean);
+
+/* =============================================================================
+   HELPERS
+   ============================================================================= */
+const $ = (sel, root = document) => root.querySelector(sel);
+const PROP_KEYS = new Set(["value", "checked", "disabled", "selected", "readOnly"]);
+
+/** Safe DOM builder: text is always added as text nodes (never as HTML). */
+function el(tag, attrs, ...kids) {
+  const node = document.createElement(tag);
+  if (attrs) {
+    for (const [k, v] of Object.entries(attrs)) {
+      if (v === undefined || v === null || v === false) continue;
+      if (k === "class") node.className = v;
+      else if (k === "style" && typeof v === "object") {
+        for (const [sk, sv] of Object.entries(v)) {
+          if (sk.startsWith("--")) node.style.setProperty(sk, sv); else node.style[sk] = sv;
+        }
+      } else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
+      else if (PROP_KEYS.has(k)) node[k] = v;
+      else node.setAttribute(k, v === true ? "" : String(v));
+    }
+  }
+  for (const kid of kids.flat(Infinity)) {
+    if (kid === null || kid === undefined || kid === false) continue;
+    node.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  }
+  return node;
+}
+
+function selectEl(options, value, attrs) {
+  const s = el("select", attrs, options.map((o) => el("option", { value: o.value }, o.label)));
+  s.value = value;
+  if (s.value !== value && options.length) s.value = options[0].value;
+  return s;
+}
+const field = (label, control, hint) =>
+  el("label", { class: "field" }, el("span", { class: "lbl" }, label), control, hint ? el("small", { class: "hint" }, hint) : null);
+
+const str = (v, max) => (typeof v === "string" ? v : "").slice(0, max);
+const isFiniteNum = (v) => typeof v === "number" && Number.isFinite(v);
+const isHex = (v) => typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v);
+const randId = (n = 4) => Math.random().toString(36).slice(2, 2 + n).padEnd(n, "0");
+const pad2 = (n) => String(n).padStart(2, "0");
+const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+const locale = () => (state.lang === "bn" ? "bn-BD" : "en-US");
+const fmtNum = (n) => new Intl.NumberFormat(locale(), { maximumFractionDigits: 2 }).format(isFiniteNum(n) ? n : 0);
+const money = (n) => `${state.settings.currencySymbol}${fmtNum(n)}`;
+const toMs = (v) => (v && typeof v.toMillis === "function" ? v.toMillis() : (isFiniteNum(v) ? v : 0));
+const isoDate = (ms) => (ms ? new Date(ms).toISOString().slice(0, 10) : "");
+
+function fmtDate(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s || "")) return s || "";
+  const d = new Date(s + "T00:00:00");
+  return isNaN(d) ? s : d.toLocaleDateString(locale(), { year: "numeric", month: "short", day: "numeric" });
+}
+const fmtMs = (ms) => (ms ? new Date(ms).toLocaleDateString(locale(), { year: "numeric", month: "short", day: "numeric" }) : "");
+
+/** Only http/https URLs are accepted. Returns "" if invalid. */
+function safeUrl(u) {
+  if (typeof u !== "string" || !u.trim()) return "";
+  try {
+    const url = new URL(u.trim());
+    return (url.protocol === "http:" || url.protocol === "https:") ? url.href : "";
+  } catch { return ""; }
+}
+const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return u; } };
+
+function slugKey(label, existing) {
+  const base = "f_" + (String(label).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 16) || "x");
+  let key;
+  do { key = `${base}_${randId(4)}`; } while (existing.has(key));
+  return key;
+}
+
+const itemTotal = (it) => (it.price || 0) * (it.quantity || 0);
+const getGroup = (id) => state.groups.find((g) => g.id === id);
+const getCategory = (id) => state.categories.find((c) => c.id === id);
+const categoriesOf = (groupId) => state.categories.filter((c) => c.groupId === groupId);
+const fieldDefsOf = (groupId) => (getGroup(groupId)?.fieldDefs || []);
+const nextOrder = (list) => list.reduce((m, x) => Math.max(m, x.order || 0), 0) + 1;
+
+/* ---- normalizers: every read passes through these (safe defaults) ---- */
+function normFieldDefs(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.filter((d) => d && typeof d.key === "string" && d.key).map((d) => ({
+    key: d.key,
+    label: str(d.label, 100) || d.key,
+    type: FIELD_TYPES.includes(d.type) ? d.type : "text",
+    options: Array.isArray(d.options) ? d.options.filter((o) => typeof o === "string" && o.trim()).map((o) => o.slice(0, 100)) : []
+  }));
+}
+function normGroup(r) {
+  return {
+    id: r.id, name: str(r.name, 200) || "Untitled", icon: str(r.icon, 16) || "📁",
+    color: isHex(r.color) ? r.color : DEFAULT_COLOR, order: isFiniteNum(r.order) ? r.order : 0,
+    fieldDefs: normFieldDefs(r.fieldDefs), createdAt: r.createdAt ?? null, updatedAt: r.updatedAt ?? null
+  };
+}
+function normCategory(r) {
+  return {
+    id: r.id, groupId: str(r.groupId, 200), name: str(r.name, 200) || "Untitled",
+    order: isFiniteNum(r.order) ? r.order : 0, createdAt: r.createdAt ?? null, updatedAt: r.updatedAt ?? null
+  };
+}
+function normItem(r) {
+  const hist = Array.isArray(r.priceHistory) ? r.priceHistory
+    .filter((h) => h && isFiniteNum(h.price)).map((h) => ({ date: str(h.date, 10), price: h.price })) : [];
+  return {
+    id: r.id, groupId: str(r.groupId, 200), categoryId: str(r.categoryId, 200),
+    name: str(r.name, 200) || "Untitled", productLink: str(r.productLink, 2000), imageUrl: str(r.imageUrl, 2000),
+    price: isFiniteNum(r.price) && r.price >= 0 ? r.price : 0,
+    quantity: isFiniteNum(r.quantity) && r.quantity >= 0 ? r.quantity : 1,
+    priority: PRIORITIES.includes(r.priority) ? r.priority : "medium",
+    status: STATUSES.includes(r.status) ? r.status : "want",
+    targetDate: /^\d{4}-\d{2}-\d{2}$/.test(r.targetDate || "") ? r.targetDate : "",
+    description: str(r.description, 5000), notes: str(r.notes, 5000),
+    custom: (r.custom && typeof r.custom === "object" && !Array.isArray(r.custom)) ? r.custom : {},
+    priceHistory: hist, boughtAt: r.boughtAt ?? null, createdAt: r.createdAt ?? null, updatedAt: r.updatedAt ?? null
+  };
+}
+/** Plain writable fields of an item (no id / timestamps). */
+function pickItemData(it) {
+  return {
+    groupId: it.groupId, categoryId: it.categoryId, name: it.name, productLink: it.productLink, imageUrl: it.imageUrl,
+    price: it.price, quantity: it.quantity, priority: it.priority, status: it.status, targetDate: it.targetDate,
+    description: it.description, notes: it.notes, custom: it.custom, priceHistory: it.priceHistory
+  };
+}
+
+/* ---- toasts / modals / confirm ---- */
+function toast(msg, type = "info") {
+  const box = $("#toasts");
+  const node = el("div", { class: `toast toast-${type}`, role: "status" }, msg);
+  box.append(node);
+  setTimeout(() => { node.classList.add("out"); setTimeout(() => node.remove(), 300); }, type === "error" ? 5000 : 3000);
+}
+
+const modalStack = [];
+function openModal({ title, size = "", onClose } = {}) {
+  const body = el("div", { class: "modal-body" });
+  const footer = el("div", { class: "modal-foot" });
+  const api = {
+    body, footer, closed: false,
+    close() {
+      if (api.closed) return;
+      api.closed = true; overlay.remove();
+      modalStack.splice(modalStack.indexOf(api), 1);
+      if (!modalStack.length) document.body.classList.remove("modal-open");
+      if (onClose) onClose();
+    }
+  };
+  const box = el("div", { class: `modal ${size}`, role: "dialog", "aria-modal": "true" },
+    el("div", { class: "modal-head" }, el("h3", null, title),
+      el("button", { class: "icon-btn", type: "button", "aria-label": t("close"), onclick: () => api.close() }, "✕")),
+    body, footer);
+  const overlay = el("div", { class: "overlay" }, box);
+  overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) api.close(); });
+  modalStack.push(api);
+  document.body.append(overlay);
+  document.body.classList.add("modal-open");
+  return api;
+}
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && modalStack.length) modalStack[modalStack.length - 1].close();
+});
+
+function confirmDialog({ title, message, confirmText, danger = true, extra }) {
+  return new Promise((resolve) => {
+    let result = false;
+    const m = openModal({ title, size: "sm", onClose: () => resolve(result) });
+    m.body.append(el("p", { class: "pre" }, message));
+    if (extra) m.body.append(extra);
+    m.footer.append(
+      el("button", { class: "btn", type: "button", onclick: () => m.close() }, t("cancel")),
+      el("button", { class: `btn ${danger ? "btn-danger" : "btn-primary"}`, type: "button", onclick: () => { result = true; m.close(); } }, confirmText || t("delete"))
+    );
+  });
+}
+
+/** Runs a Firestore action; errors -> toast. If the server does not answer in time
+ *  (offline), the write is queued by Firestore and we tell the user. */
+async function run(fn, okMsg, timeoutMs = 6000) {
+  try {
+    const p = Promise.resolve().then(fn);
+    const r = await Promise.race([p, new Promise((res) => setTimeout(() => res("__pending__"), timeoutMs))]);
+    if (r === "__pending__") {
+      toast(t("toastQueued"), "info");
+      p.catch((e) => { console.error(e); toast(errText(e), "error"); });
+      return true;
+    }
+    if (okMsg) toast(okMsg, "success");
+    return true;
+  } catch (e) {
+    console.error(e);
+    toast(errText(e), "error");
+    return false;
+  }
+}
+const errText = (e) => `${t("errGeneric")}: ${e && (e.code || e.message) ? (e.code || e.message) : e}`;
+
+function downloadFile(filename, content, mime) {
+  const blob = content instanceof Blob ? content : new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = el("a", { href: url, download: filename });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/** Image with lazy loading, no-referrer and a placeholder when it fails. */
+function makeImage(url, alt, cls = "") {
+  const box = el("div", { class: `imgbox ${cls}` });
+  const showPlaceholder = () => { box.replaceChildren(el("div", { class: "img-ph", title: t("imageFail") }, "🖼️")); };
+  const safe = safeUrl(url);
+  if (!safe) { showPlaceholder(); return box; }
+  const img = el("img", { src: safe, alt: alt || "", loading: "lazy", decoding: "async", referrerpolicy: "no-referrer" });
+  img.addEventListener("error", showPlaceholder, { once: true });
+  box.append(img);
+  return box;
+}
+
+/* =============================================================================
+   DB LAYER  (the ONLY place that touches Firestore)
+   ============================================================================= */
+let db = null;
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; renderAll(); });
+}
+
+function dbInit() {
+  const app = initializeApp(FIREBASE_CONFIG);
+  try {
+    db = initializeFirestore(app, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
+  } catch (e) {
+    console.warn("Persistent cache unavailable, using default.", e);
+    db = getFirestore(app);
+  }
+}
+
+function dbSubscribeAll() {
+  const fail = (name) => (err) => {
+    console.error(name, err);
+    state.dbError = `${name}: ${err.code || err.message}`;
+    state.loaded[name] = true; scheduleRender();
+  };
+  const listen = (name, norm, sortFn) => onSnapshot(collection(db, name), (snap) => {
+    state[name] = snap.docs.map((d) => norm({ ...d.data({ serverTimestamps: "estimate" }), id: d.id })).sort(sortFn);
+    state.loaded[name] = true; state.dbError = ""; scheduleRender();
+  }, fail(name));
+  const byOrder = (a, b) => (a.order - b.order) || a.name.localeCompare(b.name);
+  listen("groups", normGroup, byOrder);
+  listen("categories", normCategory, byOrder);
+  listen("items", normItem, () => 0);
+  onSnapshot(doc(db, "meta", "app"), (snap) => {
+    const d = snap.exists() ? snap.data() : {};
+    state.settings = {
+      siteTitle: str(d.siteTitle, 200) || DEFAULT_SETTINGS.siteTitle,
+      currencySymbol: str(d.currencySymbol, 16) || DEFAULT_SETTINGS.currencySymbol
+    };
+    state.loaded.meta = true; scheduleRender();
+  }, fail("meta"));
+}
+
+async function dbCommitOps(ops) {            // chunked batch writes
+  for (let i = 0; i < ops.length; i += BATCH_LIMIT) {
+    const batch = writeBatch(db);
+    for (const op of ops.slice(i, i + BATCH_LIMIT)) {
+      if (op.type === "delete") batch.delete(op.ref);
+      else if (op.type === "update") batch.update(op.ref, op.data);
+      else batch.set(op.ref, op.data);
+    }
+    await batch.commit();
+  }
+}
+
+const dbSaveMeta = (s) => setDoc(doc(db, "meta", "app"),
+  { schemaVersion: SCHEMA_VERSION, currencySymbol: s.currencySymbol, siteTitle: s.siteTitle }, { merge: true });
+
+const dbCreateGroup = (g) => addDoc(collection(db, "groups"), { ...g, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+const dbUpdateGroup = (id, patch) => updateDoc(doc(db, "groups", id), { ...patch, updatedAt: serverTimestamp() });
+
+async function dbCreateSampleGroups(list) {
+  let order = nextOrder(state.groups);
+  const ops = list.map((g) => ({
+    type: "set", ref: doc(collection(db, "groups")),
+    data: { name: g.name, icon: g.icon, color: g.color, order: order++, fieldDefs: [], createdAt: serverTimestamp(), updatedAt: serverTimestamp() }
+  }));
+  await dbCommitOps(ops);
+}
+
+async function dbDeleteGroupCascade(groupId) {
+  const [its, cats] = await Promise.all([
+    getDocs(query(collection(db, "items"), where("groupId", "==", groupId))),
+    getDocs(query(collection(db, "categories"), where("groupId", "==", groupId)))
+  ]);
+  const ops = [...its.docs, ...cats.docs].map((d) => ({ type: "delete", ref: d.ref }));
+  ops.push({ type: "delete", ref: doc(db, "groups", groupId) });   // group last
+  await dbCommitOps(ops);
+}
+
+const dbCreateCategory = (c) => addDoc(collection(db, "categories"), { ...c, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+const dbUpdateCategory = (id, patch) => updateDoc(doc(db, "categories", id), { ...patch, updatedAt: serverTimestamp() });
+
+async function dbDeleteCategory(categoryId) {
+  const its = await getDocs(query(collection(db, "items"), where("categoryId", "==", categoryId)));
+  const ops = its.docs.map((d) => ({ type: "update", ref: d.ref, data: { categoryId: "", updatedAt: serverTimestamp() } }));
+  ops.push({ type: "delete", ref: doc(db, "categories", categoryId) });
+  await dbCommitOps(ops);
+}
+
+const dbCreateItem = (data) => addDoc(collection(db, "items"), { ...data, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+const dbUpdateItem = (id, patch) => updateDoc(doc(db, "items", id), { ...patch, updatedAt: serverTimestamp() });
+const dbDeleteItem = (id) => deleteDoc(doc(db, "items", id));
+
+const toStamp = (v) => { const ms = toMs(v); return ms > 0 ? Timestamp.fromMillis(ms) : serverTimestamp(); };
+
+/** Restore from parsed backup. mode: "merge" | "replace". */
+async function dbImportBackup(bk, mode) {
+  const ops = [];
+  if (mode === "replace") {
+    for (const name of ["items", "categories", "groups"]) {
+      const snap = await getDocs(collection(db, name));
+      snap.docs.forEach((d) => ops.push({ type: "delete", ref: d.ref }));
+    }
+  }
+  bk.groups.forEach((g) => ops.push({ type: "set", ref: doc(db, "groups", g.id), data: {
+    name: g.name, icon: g.icon, color: g.color, order: g.order, fieldDefs: g.fieldDefs,
+    createdAt: toStamp(g.createdAt), updatedAt: serverTimestamp() } }));
+  bk.categories.forEach((c) => ops.push({ type: "set", ref: doc(db, "categories", c.id), data: {
+    groupId: c.groupId, name: c.name, order: c.order, createdAt: toStamp(c.createdAt), updatedAt: serverTimestamp() } }));
+  bk.items.forEach((i) => ops.push({ type: "set", ref: doc(db, "items", i.id), data: {
+    ...pickItemData(i), boughtAt: toMs(i.boughtAt) > 0 ? Timestamp.fromMillis(toMs(i.boughtAt)) : null,
+    createdAt: toStamp(i.createdAt), updatedAt: serverTimestamp() } }));
+  await dbCommitOps(ops);
+  if (mode === "replace" && bk.meta) {
+    await dbSaveMeta({
+      siteTitle: str(bk.meta.siteTitle, 200) || DEFAULT_SETTINGS.siteTitle,
+      currencySymbol: str(bk.meta.currencySymbol, 16) || DEFAULT_SETTINGS.currencySymbol
+    });
+  }
+}
+
+/* =============================================================================
+   RENDER FUNCTIONS
+   ============================================================================= */
+function applyTheme() { document.documentElement.dataset.theme = state.theme; }
+function applyLang() { document.documentElement.lang = state.lang; }
+
+function buildShell() {
+  const app = $("#app");
+  app.replaceChildren(
+    buildTopbar(),
+    el("div", { id: "banner" }),
+    el("main", { class: "container" },
+      el("section", { id: "dashboard" }),
+      el("section", { id: "groupBar" }),
+      buildFilterBar(),
+      el("section", { id: "itemsGrid", class: "grid" })),
+    VIEW_ONLY ? null : el("button", { id: "addItemFab", class: "fab no-print edit-only", type: "button", onclick: () => openItemForm(null, state.ui.groupId) },
+      el("span", { class: "fab-plus" }, "＋"), el("span", { class: "lbl" }, t("addItem")))
+  );
+}
+
+function buildTopbar() {
+  const btn = (icon, label, fn, extra = "") =>
+    el("button", { class: `btn btn-ghost ${extra}`, type: "button", title: label, "aria-label": label, onclick: fn },
+      el("span", { class: "ico" }, icon), el("span", { class: "lbl" }, label));
+  return el("header", { class: "topbar" },
+    el("div", { class: "topbar-in" },
+      el("h1", { class: "brand" }, el("span", { class: "brand-ico" }, "🎁"), el("span", { id: "siteTitleText" }, state.settings.siteTitle)),
+      VIEW_ONLY ? el("span", { class: "pill" }, t("viewOnly")) : null,
+      el("div", { class: "actions no-print" },
+        btn("💰", t("budget"), openBudget),
+        btn("💾", t("backup"), openBackup),
+        btn("🖨️", t("print"), () => window.print(), "hide-sm"),
+        btn("⚙️", t("settings"), openSettings),
+        el("button", { class: "icon-btn", type: "button", title: t("theme"), "aria-label": t("theme"),
+          onclick: () => { state.theme = state.theme === "dark" ? "light" : "dark"; lsSet("wl_theme", state.theme); applyTheme(); $("#themeToggleIcon").textContent = state.theme === "dark" ? "☀️" : "🌙"; } },
+          el("span", { id: "themeToggleIcon" }, state.theme === "dark" ? "☀️" : "🌙")),
+        el("button", { class: "icon-btn lang-btn", type: "button", title: t("language"), "aria-label": t("language"),
+          onclick: () => setLanguage(state.lang === "bn" ? "en" : "bn") }, state.lang === "bn" ? "EN" : "বাং"))));
+}
+
+function setLanguage(lang) {
+  state.lang = lang; lsSet("wl_lang", lang); applyLang();
+  buildShell(); renderAll();
+}
+
+function buildFilterBar() {
+  const ui = state.ui;
+  const onChange = (key) => (e) => { ui[key] = e.target.value; renderItems(); };
+  return el("section", { id: "filterBar", class: "filters no-print" },
+    el("input", { id: "searchInput", class: "input search", type: "search", placeholder: t("searchPh"), value: ui.search,
+      oninput: (e) => { ui.search = e.target.value; renderItems(); } }),
+    el("div", { class: "filter-row" },
+      el("select", { id: "filterCategory", class: "input", onchange: onChange("categoryId") }),
+      selectEl([{ value: "all", label: t("allStatuses") }, ...STATUSES.map((s) => ({ value: s, label: t(s) }))], ui.status, { id: "filterStatus", class: "input", onchange: onChange("status") }),
+      selectEl([{ value: "all", label: t("allPriorities") }, ...PRIORITIES.map((p) => ({ value: p, label: t(p) }))], ui.priority, { id: "filterPriority", class: "input", onchange: onChange("priority") }),
+      selectEl([
+        { value: "newest", label: t("sortNewest") }, { value: "priceHigh", label: t("sortPriceHigh") },
+        { value: "priceLow", label: t("sortPriceLow") }, { value: "name", label: t("sortName") },
+        { value: "priority", label: t("sortPriority") }], ui.sort, { id: "sortSelect", class: "input", onchange: onChange("sort") }),
+      el("button", { class: "btn btn-sm", type: "button", onclick: resetFilters }, t("reset"))),
+    el("div", { id: "resultCount", class: "muted small" }));
+}
+
+function resetFilters() {
+  Object.assign(state.ui, { search: "", categoryId: "all", status: "all", priority: "all", sort: "newest" });
+  $("#searchInput").value = ""; $("#filterStatus").value = "all"; $("#filterPriority").value = "all"; $("#sortSelect").value = "newest";
+  updateFilterOptions(); renderItems();
+}
+
+function updateFilterOptions() {
+  const sel = $("#filterCategory"); if (!sel) return;
+  const gid = state.ui.groupId;
+  const cats = gid === "all" ? state.categories : categoriesOf(gid);
+  const opts = [{ value: "all", label: t("allCategories") }, { value: "none", label: t("uncategorized") }];
+  cats.forEach((c) => opts.push({ value: c.id, label: gid === "all" ? `${getGroup(c.groupId)?.name || "?"} › ${c.name}` : c.name }));
+  if (!opts.some((o) => o.value === state.ui.categoryId)) state.ui.categoryId = "all";
+  sel.replaceChildren(...opts.map((o) => el("option", { value: o.value }, o.label)));
+  sel.value = state.ui.categoryId;
+}
+
+function renderAll() {
+  const title = $("#siteTitleText"); if (title) title.textContent = state.settings.siteTitle;
+  document.title = state.settings.siteTitle;
+  renderBanner();
+  if (!isConfigured()) {
+    ["#dashboard", "#groupBar", "#itemsGrid"].forEach((s) => $(s).replaceChildren());
+    $("#filterBar").hidden = true; const fab = $("#addItemFab"); if (fab) fab.hidden = true;
+    return;
+  }
+  if (state.ui.groupId !== "all" && !getGroup(state.ui.groupId) && state.loaded.groups) state.ui.groupId = "all";
+  renderDashboard(); renderGroupBar(); updateFilterOptions(); renderItems();
+}
+
+function renderBanner() {
+  const b = $("#banner"); b.replaceChildren();
+  if (!isConfigured()) {
+    b.append(el("div", { class: "banner banner-warn" }, el("strong", null, "🔧 " + t("setupTitle")), el("p", null, t("setupBody"))));
+  } else if (state.dbError) {
+    b.append(el("div", { class: "banner banner-error" }, el("strong", null, "⚠️ " + t("dbErrorTitle")), el("p", null, t("dbErrorHint")), el("code", null, state.dbError)));
+  }
+}
+
+/* ---- dashboard ---- */
+function computeStats(items) {
+  const s = { total: 0, remaining: 0, bought: 0, count: { all: items.length, want: 0, bought: 0, skipped: 0 }, byGroup: {} };
+  for (const it of items) {
+    s.count[it.status]++;
+    const bg = (s.byGroup[it.groupId] = s.byGroup[it.groupId] || { total: 0, remaining: 0, count: 0 });
+    bg.count++;
+    if (it.status === "skipped") continue;
+    const v = itemTotal(it);
+    s.total += v; bg.total += v;
+    if (it.status === "bought") s.bought += v; else { s.remaining += v; bg.remaining += v; }
+  }
+  return s;
+}
+
+function renderDashboard() {
+  const root = $("#dashboard"); root.replaceChildren();
+  if (!allLoaded()) {
+    root.append(el("div", { class: "stats" }, [0, 1, 2, 3].map(() => el("div", { class: "stat skel", style: { height: "78px" } }))));
+    return;
+  }
+  const s = computeStats(state.items);
+  const stat = (label, value, sub, cls = "") => el("div", { class: `stat ${cls}` },
+    el("div", { class: "stat-label" }, label), el("div", { class: "stat-value" }, value), sub ? el("div", { class: "stat-sub" }, sub) : null);
+  root.append(el("div", { class: "stats" },
+    stat(t("dashTotal"), money(s.total), t("dashNote")),
+    stat(t("dashRemaining"), money(s.remaining), `${s.count.want} ${t("want")}`, "stat-warn"),
+    stat(t("dashBought"), money(s.bought), `${s.count.bought} ${t("bought")}`, "stat-ok"),
+    stat(t("dashItems"), fmtNum(s.count.all), `${s.count.want} ${t("want")} · ${s.count.bought} ${t("bought")} · ${s.count.skipped} ${t("skipped")}`)));
+  if (state.groups.length) {
+    root.append(el("div", { class: "group-totals" }, el("div", { class: "muted small" }, t("dashPerGroup")),
+      el("div", { class: "gt-row" }, state.groups.map((g) => {
+        const bg = s.byGroup[g.id] || { total: 0, remaining: 0, count: 0 };
+        return el("button", { class: "gt", type: "button", style: { "--c": g.color }, onclick: () => selectGroup(g.id) },
+          el("span", { class: "gt-name" }, `${g.icon} ${g.name}`),
+          el("span", { class: "gt-total" }, money(bg.total)),
+          el("span", { class: "gt-sub" }, `${t("dashRemaining")}: ${money(bg.remaining)}`));
+      }))));
+  }
+}
+
+/* ---- group bar ---- */
+function selectGroup(id) {
+  state.ui.groupId = id; state.ui.categoryId = "all";
+  renderGroupBar(); updateFilterOptions(); renderItems();
+}
+
+function renderGroupBar() {
+  const bar = $("#groupBar"); bar.replaceChildren();
+  if (!allLoaded()) return;
+  const counts = {}; state.items.forEach((i) => { counts[i.groupId] = (counts[i.groupId] || 0) + 1; });
+  const chip = (id, icon, name, color, count) => el("button", {
+    class: `chip ${state.ui.groupId === id ? "active" : ""}`, type: "button", style: { "--c": color || DEFAULT_COLOR }, onclick: () => selectGroup(id)
+  }, el("span", null, `${icon} ${name}`), el("span", { class: "chip-count" }, fmtNum(count)));
+  const chips = el("div", { class: "chips" }, chip("all", "🗂️", t("all"), DEFAULT_COLOR, state.items.length),
+    state.groups.map((g) => chip(g.id, g.icon, g.name, g.color, counts[g.id] || 0)));
+  if (!VIEW_ONLY) chips.append(el("button", { class: "chip chip-add edit-only", type: "button", onclick: () => openGroupForm() }, "＋ " + t("addGroup")));
+  bar.append(chips);
+  const g = getGroup(state.ui.groupId);
+  if (!VIEW_ONLY && g) {
+    bar.append(el("div", { class: "group-actions edit-only" },
+      el("button", { class: "btn btn-sm", type: "button", onclick: () => openGroupForm(g) }, "✏️ " + t("editGroup")),
+      el("button", { class: "btn btn-sm", type: "button", onclick: () => openCategoriesManager(g.id) }, "🏷️ " + t("categories")),
+      el("button", { class: "btn btn-sm", type: "button", onclick: () => openFieldsManager(g.id) }, "🧩 " + t("customFields")),
+      el("button", { class: "btn btn-sm btn-danger-ghost", type: "button", onclick: () => deleteGroupFlow(g) }, "🗑️ " + t("deleteGroup"))));
+  }
+}
+
+/* ---- items ---- */
+function getVisibleItems() {
+  const ui = state.ui, q = ui.search.trim().toLowerCase();
+  let list = state.items.filter((it) => {
+    if (ui.groupId !== "all" && it.groupId !== ui.groupId) return false;
+    if (ui.categoryId === "none" ? it.categoryId !== "" : (ui.categoryId !== "all" && it.categoryId !== ui.categoryId)) return false;
+    if (ui.status !== "all" && it.status !== ui.status) return false;
+    if (ui.priority !== "all" && it.priority !== ui.priority) return false;
+    return !q || it.name.toLowerCase().includes(q);
+  });
+  const byName = (a, b) => a.name.localeCompare(b.name, state.lang);
+  const cmp = {
+    newest: (a, b) => toMs(b.createdAt) - toMs(a.createdAt),
+    priceHigh: (a, b) => b.price - a.price, priceLow: (a, b) => a.price - b.price, name: byName,
+    priority: (a, b) => (PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]) || byName(a, b)
+  }[ui.sort] || (() => 0);
+  return list.sort(cmp);
+}
+
+function renderItems() {
+  const grid = $("#itemsGrid"); grid.replaceChildren();
+  const count = $("#resultCount");
+  if (!allLoaded()) {
+    for (let i = 0; i < 6; i++) grid.append(el("div", { class: "card skel-card" }, el("div", { class: "skel", style: { aspectRatio: "4/3" } }),
+      el("div", { class: "card-body" }, el("div", { class: "skel", style: { height: "16px", width: "70%" } }), el("div", { class: "skel", style: { height: "14px", width: "40%", marginTop: "10px" } }))));
+    if (count) count.textContent = ""; return;
+  }
+  if (!state.groups.length) {
+    grid.append(el("div", { class: "empty" }, el("div", { class: "empty-ico" }, "🎁"), el("h3", null, t("emptyNoGroupsTitle")),
+      el("p", null, VIEW_ONLY ? t("emptyViewOnly") : t("emptyNoGroupsText")),
+      VIEW_ONLY ? null : el("div", { class: "empty-actions edit-only" },
+        el("button", { class: "btn btn-primary", type: "button", onclick: () => openGroupForm() }, "＋ " + t("createGroup")),
+        el("button", { class: "btn", type: "button", onclick: addSampleGroupsFlow }, "✨ " + t("addSampleGroups")))));
+    if (count) count.textContent = ""; return;
+  }
+  const visible = getVisibleItems();
+  const total = state.ui.groupId === "all" ? state.items.length : state.items.filter((i) => i.groupId === state.ui.groupId).length;
+  if (count) count.textContent = t("showing", { n: visible.length, total });
+  if (!visible.length) {
+    const noItems = total === 0;
+    grid.append(el("div", { class: "empty" }, el("div", { class: "empty-ico" }, noItems ? "📭" : "🔍"),
+      el("h3", null, noItems ? t("emptyNoItemsTitle") : t("emptyNoMatch")),
+      noItems ? el("p", null, VIEW_ONLY ? t("emptyViewOnly") : t("emptyNoItemsText")) : null,
+      noItems && !VIEW_ONLY ? el("div", { class: "empty-actions edit-only" },
+        el("button", { class: "btn btn-primary", type: "button", onclick: () => openItemForm(null, state.ui.groupId) }, "＋ " + t("addItem"))) : null));
+    return;
+  }
+  visible.forEach((it) => grid.append(renderItemCard(it)));
+}
+
+/** Display value of a custom field (text or node). */
+function customValueNode(def, val, asLink) {
+  switch (def.type) {
+    case "checkbox": return val ? "✓ " + t("yes") : "✗ " + t("no");
+    case "number": return isFiniteNum(val) ? fmtNum(val) : String(val);
+    case "date": return fmtDate(String(val));
+    case "url": {
+      const u = safeUrl(String(val));
+      if (!u) return String(val);
+      return asLink ? el("a", { href: u, target: "_blank", rel: "noopener noreferrer" }, hostOf(u)) : hostOf(u);
+    }
+    default: return String(val);
+  }
+}
+function customEntries(it, includeFalse) {
+  return fieldDefsOf(it.groupId).map((def) => ({ def, val: it.custom[def.key] }))
+    .filter(({ def, val }) => val !== undefined && val !== null && val !== "" && (includeFalse || def.type !== "checkbox" || val === true));
+}
+
+function renderItemCard(it) {
+  const g = getGroup(it.groupId), c = getCategory(it.categoryId);
+  const act = (icon, label, fn, cls = "") => el("button", { class: `icon-btn ${cls}`, type: "button", title: label, "aria-label": label,
+    onclick: (e) => { e.stopPropagation(); fn(); } }, icon);
+  const customs = customEntries(it, false).slice(0, 3);
+  const card = el("article", {
+    class: `card status-${it.status}`, tabindex: "0", role: "button", "aria-label": it.name, style: { "--c": g ? g.color : DEFAULT_COLOR },
+    onclick: () => openDetail(it.id),
+    onkeydown: (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === card) { e.preventDefault(); openDetail(it.id); } }
+  },
+    el("div", { class: "card-media" }, makeImage(it.imageUrl, it.name),
+      el("span", { class: `badge st-${it.status}` }, t(it.status)),
+      el("span", { class: `prio prio-${it.priority}`, title: t(it.priority) }, t(it.priority))),
+    el("div", { class: "card-body" },
+      el("h3", { class: "card-title" }, it.name),
+      el("div", { class: "card-meta" },
+        state.ui.groupId === "all" && g ? el("span", { class: "tag" }, `${g.icon} ${g.name}`) : null,
+        c ? el("span", { class: "tag tag-soft" }, c.name) : null,
+        it.targetDate ? el("span", { class: "tag tag-soft" }, "📅 " + fmtDate(it.targetDate)) : null),
+      el("div", { class: "card-price" }, el("span", { class: "price" }, money(it.price)),
+        it.quantity !== 1 ? el("span", { class: "muted small" }, `× ${fmtNum(it.quantity)} = `) : null,
+        it.quantity !== 1 ? el("strong", null, money(itemTotal(it))) : null),
+      customs.length ? el("dl", { class: "mini-dl" }, customs.map(({ def, val }) => [el("dt", null, def.label), el("dd", null, customValueNode(def, val, false))])) : null),
+    VIEW_ONLY ? null : el("div", { class: "card-actions no-print edit-only" },
+      act("✏️", t("edit"), () => openItemForm(it)),
+      act("📄", t("duplicate"), () => duplicateItem(it)),
+      it.status !== "bought" ? act("✅", t("markBought"), () => setBought(it, true)) : null,
+      act("🗑️", t("delete"), () => deleteItemFlow(it), "danger")));
+  return card;
+}
+
+/* =============================================================================
+   MODALS / FORMS
+   ============================================================================= */
+
+/* ---- group form ---- */
+function openGroupForm(group) {
+  const isEdit = !!group;
+  const m = openModal({ title: isEdit ? t("editGroup") : t("addGroup"), size: "sm" });
+  const name = el("input", { class: "input", type: "text", maxlength: "100", value: group ? group.name : "", placeholder: t("groupName") });
+  const icon = el("input", { class: "input", type: "text", maxlength: "8", value: group ? group.icon : "🎯" });
+  const color = el("input", { class: "color-input", type: "color", value: group ? group.color : DEFAULT_COLOR });
+  const emojiRow = el("div", { class: "pick-row" }, EMOJI_CHOICES.map((e) => el("button", { class: "pick", type: "button", onclick: () => { icon.value = e; } }, e)));
+  const colorRow = el("div", { class: "pick-row" }, COLOR_PRESETS.map((c) => el("button", { class: "pick swatch", type: "button", style: { background: c }, "aria-label": c, onclick: () => { color.value = c; } })));
+  m.body.append(field(t("groupName"), name), field(t("icon"), icon), emojiRow, field(t("color"), color), colorRow);
+  const saveBtn = el("button", { class: "btn btn-primary", type: "button" }, t("save"));
+  saveBtn.onclick = async () => {
+    const n = name.value.trim();
+    if (!n) { toast(t("nameRequired"), "error"); name.focus(); return; }
+    saveBtn.disabled = true;
+    const data = { name: n, icon: icon.value.trim() || "📁", color: isHex(color.value) ? color.value : DEFAULT_COLOR };
+    let newId = null;
+    const ok = await run(async () => {
+      if (isEdit) await dbUpdateGroup(group.id, data);
+      else { const ref = await dbCreateGroup({ ...data, order: nextOrder(state.groups), fieldDefs: [] }); newId = ref.id; }
+    }, t("toastSaved"));
+    if (ok) { if (newId) selectGroup(newId); m.close(); } else saveBtn.disabled = false;
+  };
+  name.addEventListener("keydown", (e) => { if (e.key === "Enter") saveBtn.click(); });
+  m.footer.append(el("button", { class: "btn", type: "button", onclick: () => m.close() }, t("cancel")), saveBtn);
+  setTimeout(() => name.focus(), 50);
+}
+
+async function deleteGroupFlow(g) {
+  const items = state.items.filter((i) => i.groupId === g.id).length, cats = categoriesOf(g.id).length;
+  const ok = await confirmDialog({ title: t("confirmDeleteGroupTitle"), message: t("confirmDeleteGroupMsg", { name: g.name, items, cats }) });
+  if (!ok) return;
+  const done = await run(() => dbDeleteGroupCascade(g.id), t("toastDeleted"), 30000);
+  if (done) selectGroup("all");
+}
+
+async function addSampleGroupsFlow() {
+  const existing = new Set(state.groups.map((g) => g.name.toLowerCase()));
+  const list = SAMPLE_GROUPS.filter((g) => !existing.has(g.name.toLowerCase()));
+  if (!list.length) { toast(t("sampleExists"), "info"); return; }
+  await run(() => dbCreateSampleGroups(list), t("toastSampleAdded"));
+}
+
+/* ---- categories manager ---- */
+function openCategoriesManager(groupId) {
+  const g = getGroup(groupId); if (!g) return;
+  const m = openModal({ title: `${g.icon} ${g.name} · ${t("categories")}`, size: "md" });
+  const listBox = el("div", { class: "rows" });
+  const newName = el("input", { class: "input", type: "text", maxlength: "100", placeholder: t("newCategory") });
+  const addBtn = el("button", { class: "btn btn-primary", type: "button" }, "＋ " + t("add"));
+  const addNew = async () => {
+    const n = newName.value.trim(); if (!n) return;
+    const ok = await run(() => dbCreateCategory({ groupId, name: n, order: nextOrder(categoriesOf(groupId)) }));
+    if (ok) { newName.value = ""; renderList(); newName.focus(); }
+  };
+  addBtn.onclick = addNew;
+  newName.addEventListener("keydown", (e) => { if (e.key === "Enter") addNew(); });
+
+  function renderList() {
+    const cats = categoriesOf(groupId);
+    listBox.replaceChildren(...(cats.length ? cats.map((c) => {
+      const input = el("input", { class: "input", type: "text", maxlength: "100", value: c.name, "aria-label": t("categoryName") });
+      const save = async () => {
+        const n = input.value.trim(); if (!n || n === c.name) { input.value = c.name; return; }
+        await run(() => dbUpdateCategory(c.id, { name: n }), t("toastSaved")); renderList();
+      };
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
+      return el("div", { class: "row" }, input,
+        el("button", { class: "btn btn-sm", type: "button", onclick: save }, "💾 " + t("save")),
+        el("button", { class: "icon-btn danger", type: "button", title: t("delete"), "aria-label": t("delete"), onclick: async () => {
+          const n = state.items.filter((i) => i.categoryId === c.id).length;
+          if (!(await confirmDialog({ title: t("confirmDeleteCatTitle"), message: t("confirmDeleteCatMsg", { name: c.name, items: n }) }))) return;
+          await run(() => dbDeleteCategory(c.id), t("toastDeleted"), 15000); renderList();
+        } }, "🗑️"));
+    }) : [el("p", { class: "muted" }, t("noCategories"))]));
+  }
+  renderList();
+  m.body.append(listBox, el("div", { class: "row add-row" }, newName, addBtn));
+  m.footer.append(el("button", { class: "btn", type: "button", onclick: () => m.close() }, t("close")));
+}
+
+/* ---- custom fields manager ---- */
+function openFieldsManager(groupId) {
+  const g = getGroup(groupId); if (!g) return;
+  const m = openModal({ title: `${g.icon} ${g.name} · ${t("customFields")}`, size: "lg" });
+  let defs = g.fieldDefs.map((d) => ({ ...d, options: [...d.options] }));
+  const listBox = el("div", { class: "rows" });
+
+  function renderList() {
+    listBox.replaceChildren(...(defs.length ? defs.map((d, idx) => {
+      const label = el("input", { class: "input", type: "text", maxlength: "100", value: d.label, placeholder: t("fieldLabel"), oninput: (e) => { d.label = e.target.value; } });
+      const type = selectEl(FIELD_TYPES.map((ty) => ({ value: ty, label: t("type_" + ty) })), d.type, { class: "input", onchange: (e) => { d.type = e.target.value; renderList(); } });
+      const opts = d.type === "select" ? el("input", { class: "input", type: "text", value: d.options.join(", "), placeholder: t("fieldOptions"),
+        oninput: (e) => { d.options = e.target.value.split(",").map((s) => s.trim()).filter(Boolean); } }) : null;
+      return el("div", { class: "row field-row" }, label, type, opts,
+        el("button", { class: "icon-btn danger", type: "button", title: t("delete"), "aria-label": t("delete"), onclick: async () => {
+          if (!(await confirmDialog({ title: t("delete"), message: t("confirmDeleteFieldMsg") }))) return;
+          defs.splice(idx, 1); renderList();
+        } }, "🗑️"));
+    }) : [el("p", { class: "muted" }, t("noFields"))]));
+  }
+  renderList();
+
+  const addBtn = el("button", { class: "btn", type: "button", onclick: () => {
+    defs.push({ key: slugKey("field", new Set(defs.map((d) => d.key))), label: "", type: "text", options: [] }); renderList();
+  } }, "＋ " + t("addField"));
+  m.body.append(el("p", { class: "muted small" }, t("fieldsHint")), listBox, addBtn);
+
+  const saveBtn = el("button", { class: "btn btn-primary", type: "button" }, t("save"));
+  saveBtn.onclick = async () => {
+    for (const d of defs) {
+      d.label = d.label.trim();
+      if (!d.label) { toast(t("fieldLabelRequired"), "error"); return; }
+      if (d.type === "select" && !d.options.length) { toast(t("fieldOptionsRequired"), "error"); return; }
+      if (d.type !== "select") d.options = [];
+    }
+    saveBtn.disabled = true;
+    const payload = defs.map((d) => ({ key: d.key, label: d.label, type: d.type, options: d.options }));
+    const ok = await run(() => dbUpdateGroup(groupId, { fieldDefs: payload }), t("toastSaved"));
+    if (ok) m.close(); else saveBtn.disabled = false;
+  };
+  m.footer.append(el("button", { class: "btn", type: "button", onclick: () => m.close() }, t("cancel")), saveBtn);
+}
+
+/* ---- item form ---- */
+function makeCustomControl(def, value) {
+  switch (def.type) {
+    case "checkbox": return el("input", { type: "checkbox", class: "checkbox", checked: !!value });
+    case "number": return el("input", { class: "input", type: "number", step: "any", value: isFiniteNum(value) ? String(value) : "" });
+    case "date": return el("input", { class: "input", type: "date", value: typeof value === "string" ? value : "" });
+    case "url": return el("input", { class: "input", type: "url", placeholder: "https://", value: typeof value === "string" ? value : "" });
+    case "select": {
+      const opts = [...def.options];
+      if (typeof value === "string" && value && !opts.includes(value)) opts.push(value);   // keep legacy value
+      return selectEl([{ value: "", label: "—" }, ...opts.map((o) => ({ value: o, label: o }))], typeof value === "string" ? value : "", { class: "input" });
+    }
+    default: return el("input", { class: "input", type: "text", maxlength: "2000", value: value === undefined || value === null ? "" : String(value) });
+  }
+}
+/** Returns the value to store, or undefined to remove the key. Throws on invalid link. */
+function readCustomControl(def, node) {
+  if (def.type === "checkbox") return node.checked;
+  const raw = node.value.trim(); if (raw === "") return undefined;
+  if (def.type === "number") { const n = Number(raw); return Number.isFinite(n) ? n : undefined; }
+  if (def.type === "url") { if (!safeUrl(raw)) throw new Error(t("badUrl")); return raw.slice(0, 2000); }
+  return raw.slice(0, 2000);
+}
+
+function openItemForm(item, presetGroupId) {
+  if (!state.groups.length) { toast(t("needGroup"), "error"); return; }
+  const isEdit = !!item, base = item || {};
+  const startGroup = base.groupId && getGroup(base.groupId) ? base.groupId
+    : (presetGroupId && getGroup(presetGroupId) ? presetGroupId : state.groups[0].id);
+  const m = openModal({ title: isEdit ? t("editItem") : t("addItem"), size: "lg" });
+
+  const name = el("input", { class: "input", type: "text", maxlength: "200", value: base.name || "", placeholder: t("itemName") });
+  const group = selectEl(state.groups.map((g) => ({ value: g.id, label: `${g.icon} ${g.name}` })), startGroup, { class: "input" });
+  const category = el("select", { class: "input" });
+  const price = el("input", { class: "input", type: "number", min: "0", step: "any", inputmode: "decimal", value: isEdit ? String(base.price) : "" });
+  const qty = el("input", { class: "input", type: "number", min: "1", step: "1", inputmode: "numeric", value: String(isEdit ? base.quantity : 1) });
+  const priority = selectEl(PRIORITIES.map((p) => ({ value: p, label: t(p) })), base.priority || "medium", { class: "input" });
+  const status = selectEl(STATUSES.map((s) => ({ value: s, label: t(s) })), base.status || "want", { class: "input" });
+  const target = el("input", { class: "input", type: "date", value: base.targetDate || "" });
+  const link = el("input", { class: "input", type: "url", placeholder: "https://", maxlength: "2000", value: base.productLink || "" });
+  const image = el("input", { class: "input", type: "url", placeholder: "https://…/photo.jpg", maxlength: "2000", value: base.imageUrl || "" });
+  const preview = el("div", { class: "img-preview" });
+  const desc = el("textarea", { class: "input", rows: "3", maxlength: "5000" }); desc.value = base.description || "";
+  const notes = el("textarea", { class: "input", rows: "3", maxlength: "5000" }); notes.value = base.notes || "";
+  const customBox = el("div", { class: "custom-box" });
+
+  // live image preview (debounced)
+  let previewTimer = null;
+  const updatePreview = () => {
+    const url = image.value.trim();
+    preview.replaceChildren(url ? makeImage(url, "", "preview-img") : el("div", { class: "muted small" }, t("imagePreview")));
+  };
+  image.addEventListener("input", () => { clearTimeout(previewTimer); previewTimer = setTimeout(updatePreview, 350); });
+  updatePreview();
+
+  // categories depend on selected group
+  function refreshCategories() {
+    const keep = category.value || base.categoryId || "";
+    const cats = categoriesOf(group.value);
+    category.replaceChildren(el("option", { value: "" }, "— " + t("uncategorized") + " —"), ...cats.map((c) => el("option", { value: c.id }, c.name)));
+    category.value = cats.some((c) => c.id === keep) ? keep : "";
+  }
+
+  // custom fields depend on selected group; keep typed values when switching
+  const customDraft = { ...(base.custom || {}) };
+  let customCtrls = [];
+  function captureCustom() {
+    customCtrls.forEach(({ def, node }) => {
+      try { const v = readCustomControl(def, node); if (v === undefined) delete customDraft[def.key]; else customDraft[def.key] = v; } catch { /* keep draft */ }
+    });
+  }
+  function refreshCustom() {
+    captureCustom();
+    const defs = fieldDefsOf(group.value);
+    customCtrls = defs.map((def) => ({ def, node: makeCustomControl(def, customDraft[def.key]) }));
+    customBox.replaceChildren(...customCtrls.map(({ def, node }) =>
+      def.type === "checkbox" ? el("label", { class: "field check-field" }, node, el("span", null, def.label)) : field(def.label, node)));
+    customBox.hidden = !defs.length;
+  }
+  group.addEventListener("change", () => { refreshCategories(); refreshCustom(); });
+  refreshCategories(); refreshCustom();
+
+  m.body.append(el("div", { class: "form-grid" },
+    field(t("itemName") + " *", name),
+    field(t("group"), group), field(t("category"), category),
+    field(t("price"), price), field(t("quantity"), qty),
+    field(t("priority"), priority), field(t("status"), status),
+    field(t("targetDate"), target),
+    field(t("productLink"), link),
+    el("div", { class: "span-2" }, field(t("imageUrl"), image), preview),
+    el("div", { class: "span-2" }, field(t("description"), desc)),
+    el("div", { class: "span-2" }, field(t("notes"), notes)),
+    el("div", { class: "span-2" }, customBox)));
+
+  const saveBtn = el("button", { class: "btn btn-primary", type: "button" }, t("save"));
+  saveBtn.onclick = async () => {
+    const n = name.value.trim();
+    if (!n) { toast(t("nameRequired"), "error"); name.focus(); return; }
+    const p = price.value.trim() === "" ? 0 : Number(price.value);
+    if (!Number.isFinite(p) || p < 0) { toast(t("priceInvalid"), "error"); price.focus(); return; }
+    const q = Math.floor(Number(qty.value));
+    if (!Number.isFinite(q) || q < 1) { toast(t("qtyInvalid"), "error"); qty.focus(); return; }
+    const linkVal = link.value.trim(), imgVal = image.value.trim();
+    if ((linkVal && !safeUrl(linkVal)) || (imgVal && !safeUrl(imgVal))) { toast(t("badUrl"), "error"); return; }
+    const custom = { ...customDraft };
+    try {
+      customCtrls.forEach(({ def, node }) => { const v = readCustomControl(def, node); if (v === undefined) delete custom[def.key]; else custom[def.key] = v; });
+    } catch (e) { toast(e.message, "error"); return; }
+
+    // price history: append {date, price} when price changed (or first non-zero price)
+    const history = isEdit ? [...base.priceHistory] : [];
+    if ((isEdit && p !== base.price) || (!isEdit && p > 0)) history.push({ date: todayStr(), price: p });
+
+    const data = {
+      groupId: group.value, categoryId: category.value, name: n, productLink: linkVal, imageUrl: imgVal,
+      price: p, quantity: q, priority: priority.value, status: status.value, targetDate: target.value || "",
+      description: desc.value.trim().slice(0, 5000), notes: notes.value.trim().slice(0, 5000), custom, priceHistory: history
+    };
+    if (status.value !== "bought") data.boughtAt = null;
+    else if (!isEdit || base.status !== "bought") data.boughtAt = serverTimestamp();
+
+    saveBtn.disabled = true;
+    const ok = await run(() => (isEdit ? dbUpdateItem(base.id, data) : dbCreateItem({ boughtAt: null, ...data })), t("toastSaved"));
+    if (ok) m.close(); else saveBtn.disabled = false;
+  };
+  m.footer.append(el("button", { class: "btn", type: "button", onclick: () => m.close() }, t("cancel")), saveBtn);
+  setTimeout(() => name.focus(), 50);
+}
+
+/* ---- item actions ---- */
+async function duplicateItem(it) {
+  const data = pickItemData(it);
+  data.name = `${it.name} ${t("copySuffix")}`.slice(0, 200);
+  data.status = it.status === "bought" ? "want" : it.status;
+  data.priceHistory = it.price > 0 ? [{ date: todayStr(), price: it.price }] : [];
+  await run(() => dbCreateItem({ ...data, boughtAt: null }), t("toastCreated"));
+}
+async function setBought(it, bought) {
+  await run(() => dbUpdateItem(it.id, bought ? { status: "bought", boughtAt: serverTimestamp() } : { status: "want", boughtAt: null }),
+    bought ? t("toastBought") : t("toastSaved"));
+}
+async function deleteItemFlow(it) {
+  if (!(await confirmDialog({ title: t("confirmDeleteItemTitle"), message: t("confirmDeleteItemMsg", { name: it.name }) }))) return false;
+  return run(() => dbDeleteItem(it.id), t("toastDeleted"));
+}
+
+/* ---- detail view ---- */
+function openDetail(id) {
+  const it = state.items.find((i) => i.id === id); if (!it) return;
+  const g = getGroup(it.groupId), c = getCategory(it.categoryId);
+  const m = openModal({ title: it.name, size: "lg" });
+  const info = (label, value) => el("div", { class: "info" }, el("div", { class: "muted small" }, label), el("div", { class: "info-v" }, value));
+  const prodUrl = safeUrl(it.productLink);
+  const customs = customEntries(it, true);
+  const hist = [...it.priceHistory].reverse();
+
+  m.body.append(
+    el("div", { class: "detail" },
+      makeImage(it.imageUrl, it.name, "detail-img"),
+      el("div", { class: "detail-main" },
+        el("div", { class: "card-meta" },
+          el("span", { class: `badge static st-${it.status}` }, t(it.status)),
+          el("span", { class: `badge static prio-b prio-${it.priority}` }, t(it.priority)),
+          g ? el("span", { class: "tag" }, `${g.icon} ${g.name}`) : null,
+          c ? el("span", { class: "tag tag-soft" }, c.name) : null),
+        el("div", { class: "info-grid" },
+          info(t("price"), money(it.price)), info(t("quantity"), fmtNum(it.quantity)),
+          info(t("total"), el("strong", null, money(itemTotal(it)))),
+          it.targetDate ? info(t("targetDate"), fmtDate(it.targetDate)) : null,
+          toMs(it.boughtAt) ? info(t("boughtOn"), fmtMs(toMs(it.boughtAt))) : null,
+          toMs(it.createdAt) ? info(t("createdOn"), fmtMs(toMs(it.createdAt))) : null))),
+    it.description ? el("div", { class: "section" }, el("h4", null, t("description")), el("p", { class: "pre" }, it.description)) : null,
+    it.notes ? el("div", { class: "section" }, el("h4", null, t("notes")), el("p", { class: "pre" }, it.notes)) : null,
+    customs.length ? el("div", { class: "section" }, el("h4", null, t("customFields")),
+      el("dl", { class: "dl" }, customs.map(({ def, val }) => [el("dt", null, def.label), el("dd", null, customValueNode(def, val, true))]))) : null,
+    el("div", { class: "section" }, el("h4", null, t("priceHistory")),
+      hist.length ? el("ul", { class: "history" }, hist.map((h) => el("li", null, el("span", { class: "muted" }, fmtDate(h.date)), el("strong", null, money(h.price)))))
+        : el("p", { class: "muted small" }, t("noHistory"))));
+
+  if (prodUrl) m.footer.append(el("a", { class: "btn btn-primary", href: prodUrl, target: "_blank", rel: "noopener noreferrer" }, "🔗 " + t("openProduct")));
+  if (!VIEW_ONLY) {
+    m.footer.append(
+      el("button", { class: "btn edit-only", type: "button", onclick: () => { m.close(); openItemForm(it); } }, "✏️ " + t("edit")),
+      el("button", { class: "btn edit-only", type: "button", onclick: async () => { m.close(); await setBought(it, it.status !== "bought"); } },
+        it.status !== "bought" ? "✅ " + t("markBought") : "↩️ " + t("markWant")),
+      el("button", { class: "btn btn-danger-ghost edit-only", type: "button", onclick: async () => { if (await deleteItemFlow(it)) m.close(); } }, "🗑️ " + t("delete")));
+  }
+}
+
+/* =============================================================================
+   FEATURES: budget planner, backup/export/import, settings
+   ============================================================================= */
+
+/* ---- budget planner ---- */
+function planBudget(moneyHave, groupId) {
+  const wants = state.items.filter((i) => i.status === "want" && (groupId === "all" || i.groupId === groupId));
+  wants.sort((a, b) => (PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]) || (itemTotal(a) - itemTotal(b)) || a.name.localeCompare(b.name));
+  let running = 0; const affordable = [], notYet = [];
+  for (const it of wants) {
+    const cost = itemTotal(it);
+    if (running + cost <= moneyHave) { running += cost; affordable.push({ it, cost, running, left: moneyHave - running }); }
+    else notYet.push({ it, cost });
+  }
+  return { affordable, notYet, spent: running, left: moneyHave - running, wantCount: wants.length };
+}
+
+function openBudget() {
+  const m = openModal({ title: "💰 " + t("budgetTitle"), size: "lg" });
+  const input = el("input", { class: "input", type: "number", min: "0", step: "any", inputmode: "decimal", value: state.budget.money, placeholder: "0" });
+  const groupSel = selectEl([{ value: "all", label: t("all") }, ...state.groups.map((g) => ({ value: g.id, label: `${g.icon} ${g.name}` }))], state.budget.groupId, { class: "input" });
+  const out = el("div", { class: "budget-out" });
+
+  function renderResult() {
+    state.budget.money = input.value; state.budget.groupId = groupSel.value;
+    out.replaceChildren();
+    const have = Number(input.value);
+    if (!input.value.trim() || !Number.isFinite(have) || have < 0) return;
+    const plan = planBudget(have, groupSel.value);
+    if (!plan.wantCount) { out.append(el("p", { class: "muted" }, t("budgetEmpty"))); return; }
+    out.append(el("div", { class: "stats stats-sm" },
+      el("div", { class: "stat" }, el("div", { class: "stat-label" }, t("budgetMoney")), el("div", { class: "stat-value" }, money(have))),
+      el("div", { class: "stat" }, el("div", { class: "stat-label" }, t("budgetSpent")), el("div", { class: "stat-value" }, money(plan.spent))),
+      el("div", { class: "stat stat-ok" }, el("div", { class: "stat-label" }, t("budgetLeft")), el("div", { class: "stat-value" }, money(plan.left)))));
+    out.append(el("h4", null, "✅ " + t("budgetPlan")));
+    if (!plan.affordable.length) out.append(el("p", { class: "muted" }, t("budgetNone")));
+    else out.append(el("div", { class: "table-wrap" }, el("table", { class: "tbl" },
+      el("thead", null, el("tr", null, ["#", t("colName"), t("priority"), t("colPrice"), t("colRunning"), t("colLeft")].map((h) => el("th", null, h)))),
+      el("tbody", null, plan.affordable.map((r, i) => el("tr", null,
+        el("td", null, i + 1), el("td", null, r.it.name),
+        el("td", null, el("span", { class: `prio-dot prio-${r.it.priority}` }), t(r.it.priority)),
+        el("td", null, money(r.cost)), el("td", null, money(r.running)), el("td", null, money(r.left))))))));
+    if (plan.notYet.length) {
+      out.append(el("h4", null, "⏳ " + t("budgetNot")),
+        el("ul", { class: "history" }, plan.notYet.map(({ it, cost }) => el("li", null,
+          el("span", null, `${it.name} · ${money(cost)}`),
+          el("span", { class: "muted small" }, t("budgetNeeds", { amount: money(Math.max(0, cost - plan.left)) }))))));
+    }
+  }
+  input.addEventListener("input", renderResult);
+  groupSel.addEventListener("change", renderResult);
+  m.body.append(el("div", { class: "form-grid" }, field(t("budgetMoney") + " (" + state.settings.currencySymbol + ")", input), field(t("budgetGroup"), groupSel)),
+    el("p", { class: "muted small" }, t("budgetHint")), out);
+  m.footer.append(el("button", { class: "btn", type: "button", onclick: () => m.close() }, t("close")));
+  renderResult();
+  setTimeout(() => input.focus(), 50);
+}
+
+/* ---- export helpers ---- */
+const EXPORT_BASE_HEADERS = ["ID", "Group", "Category", "Name", "Product link", "Image URL", "Price", "Quantity", "Total",
+  "Priority", "Status", "Target date", "Description", "Notes", "Bought at", "Created at"];
+
+/** Items flattened to a table; custom fields become extra columns (merged by label). */
+function buildItemsTable() {
+  const colIndex = new Map(), customCols = [];
+  state.groups.forEach((g) => g.fieldDefs.forEach((d) => { if (!colIndex.has(d.label)) { colIndex.set(d.label, customCols.length); customCols.push(d.label); } }));
+  const headers = [...EXPORT_BASE_HEADERS, ...customCols.map((l) => (EXPORT_BASE_HEADERS.includes(l) ? `${l} (custom)` : l))];
+  const groupOrder = new Map(state.groups.map((g, i) => [g.id, i]));
+  const items = [...state.items].sort((a, b) => ((groupOrder.get(a.groupId) ?? 999) - (groupOrder.get(b.groupId) ?? 999)) || a.name.localeCompare(b.name));
+  const rows = items.map((it) => {
+    const row = [it.id, getGroup(it.groupId)?.name || "", getCategory(it.categoryId)?.name || "", it.name, it.productLink, it.imageUrl,
+      it.price, it.quantity, itemTotal(it), it.priority, it.status, it.targetDate, it.description, it.notes,
+      isoDate(toMs(it.boughtAt)), isoDate(toMs(it.createdAt))];
+    const extra = new Array(customCols.length).fill("");
+    fieldDefsOf(it.groupId).forEach((d) => {
+      const v = it.custom[d.key]; if (v === undefined || v === null) return;
+      extra[colIndex.get(d.label)] = d.type === "checkbox" ? (v ? "Yes" : "No") : v;
+    });
+    return [...row, ...extra];
+  });
+  return { headers, rows };
+}
+
+function csvCell(v) {
+  let s = v === null || v === undefined ? "" : String(v);
+  if (typeof v === "string" && /^[=+@]/.test(s)) s = "'" + s;           // avoid spreadsheet formula injection
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+const stamp = () => todayStr();
+
+function exportCsv() {
+  const { headers, rows } = buildItemsTable();
+  const csv = [headers, ...rows].map((r) => r.map(csvCell).join(",")).join("\r\n");
+  downloadFile(`wishlist-items-${stamp()}.csv`, "\uFEFF" + csv, "text/csv;charset=utf-8");
+  toast(t("toastExported"), "success");
+}
+
+function exportXlsx() {
+  const X = window.XLSX;
+  if (!X) { toast(t("xlsxMissing"), "error"); return; }
+  const wb = X.utils.book_new();
+  const groupsAoa = [["ID", "Name", "Icon", "Color", "Order", "Custom fields"],
+    ...state.groups.map((g) => [g.id, g.name, g.icon, g.color, g.order, g.fieldDefs.map((d) => `${d.label} (${d.type})`).join("; ")])];
+  const catsAoa = [["ID", "Group", "Name", "Order"],
+    ...state.categories.map((c) => [c.id, getGroup(c.groupId)?.name || "", c.name, c.order])];
+  const { headers, rows } = buildItemsTable();
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(groupsAoa), "Groups");
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(catsAoa), "Categories");
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([headers, ...rows]), "Items");
+  X.writeFile(wb, `wishlist-${stamp()}.xlsx`);
+  toast(t("toastExported"), "success");
+}
+
+function exportJson() {
+  const data = {
+    app: "wishlist-manager", schemaVersion: SCHEMA_VERSION, exportedAt: new Date().toISOString(),
+    meta: { schemaVersion: SCHEMA_VERSION, ...state.settings },
+    groups: state.groups.map((g) => ({ ...g, createdAt: toMs(g.createdAt), updatedAt: toMs(g.updatedAt) })),
+    categories: state.categories.map((c) => ({ ...c, createdAt: toMs(c.createdAt), updatedAt: toMs(c.updatedAt) })),
+    items: state.items.map((i) => ({ ...i, boughtAt: toMs(i.boughtAt) || null, createdAt: toMs(i.createdAt), updatedAt: toMs(i.updatedAt) }))
+  };
+  downloadFile(`wishlist-backup-${stamp()}.json`, JSON.stringify(data, null, 2), "application/json");
+  toast(t("toastExported"), "success");
+}
+
+/* ---- import ---- */
+const validDocId = (id) => typeof id === "string" && id.length > 0 && id.length <= 200 && !id.includes("/") && id !== "." && id !== "..";
+function parseBackup(text) {
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error(t("importInvalid")); }
+  if (!data || typeof data !== "object" || !Array.isArray(data.groups) || !Array.isArray(data.categories) || !Array.isArray(data.items)) throw new Error(t("importInvalid"));
+  const ok = (x) => x && typeof x === "object" && validDocId(x.id);
+  return {
+    meta: data.meta && typeof data.meta === "object" ? data.meta : null,
+    groups: data.groups.filter(ok).map(normGroup),
+    categories: data.categories.filter(ok).map(normCategory),
+    items: data.items.filter(ok).map(normItem)
+  };
+}
+
+async function importFlow(file, mode) {
+  let bk;
+  try { bk = parseBackup(await file.text()); } catch (e) { toast(e.message, "error"); return false; }
+  const modeLabel = mode === "replace" ? t("importReplace") : t("importMerge");
+  const warn = mode === "replace" ? el("p", { class: "warn-text" }, "⚠️ " + t("importReplaceWarn")) : null;
+  const yes = await confirmDialog({
+    title: t("importConfirmTitle"), confirmText: t("importJson"), danger: mode === "replace", extra: warn,
+    message: t("importConfirmMsg", { groups: bk.groups.length, cats: bk.categories.length, items: bk.items.length, mode: modeLabel })
+  });
+  if (!yes) return false;
+  return run(() => dbImportBackup(bk, mode), t("toastImported"), 120000);
+}
+
+function openBackup() {
+  const m = openModal({ title: "💾 " + t("backupTitle"), size: "md" });
+  m.body.append(el("h4", null, t("exportSection")),
+    el("div", { class: "btn-row" },
+      el("button", { class: "btn", type: "button", onclick: exportXlsx }, "📊 " + t("exportXlsx")),
+      el("button", { class: "btn", type: "button", onclick: exportCsv }, "📄 " + t("exportCsv")),
+      el("button", { class: "btn", type: "button", onclick: exportJson }, "🧾 " + t("exportJson")),
+      el("button", { class: "btn", type: "button", onclick: () => { m.close(); setTimeout(() => window.print(), 250); } }, "🖨️ " + t("print"))));
+  if (!VIEW_ONLY) {
+    const fileInput = el("input", { class: "input", type: "file", accept: "application/json,.json" });
+    const modeSel = selectEl([{ value: "merge", label: t("importMerge") }, { value: "replace", label: t("importReplace") }], "merge", { class: "input" });
+    const importBtn = el("button", { class: "btn btn-primary", type: "button" }, "⬆️ " + t("importJson"));
+    importBtn.onclick = async () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) { toast(t("importChoose"), "error"); return; }
+      importBtn.disabled = true;
+      const ok = await importFlow(f, modeSel.value);
+      importBtn.disabled = false;
+      if (ok) m.close();
+    };
+    m.body.append(el("hr"), el("div", { class: "edit-only" }, el("h4", null, t("importSection")),
+      field(t("importChoose"), fileInput), field(t("importMode"), modeSel), importBtn));
+  }
+  m.footer.append(el("button", { class: "btn", type: "button", onclick: () => m.close() }, t("close")));
+}
+
+/* ---- settings ---- */
+function openSettings() {
+  const m = openModal({ title: "⚙️ " + t("settingsTitle"), size: "sm" });
+  const title = el("input", { class: "input", type: "text", maxlength: "200", value: state.settings.siteTitle });
+  const cur = el("input", { class: "input", type: "text", maxlength: "16", value: state.settings.currencySymbol });
+  const theme = selectEl([{ value: "light", label: t("themeLight") }, { value: "dark", label: t("themeDark") }], state.theme, { class: "input" });
+  const lang = selectEl([{ value: "bn", label: "বাংলা" }, { value: "en", label: "English" }], state.lang, { class: "input" });
+  if (!VIEW_ONLY) m.body.append(field(t("siteTitle"), title), field(t("currency"), cur));
+  m.body.append(field(t("theme"), theme), field(t("language"), lang));
+  const saveBtn = el("button", { class: "btn btn-primary", type: "button" }, t("save"));
+  saveBtn.onclick = async () => {
+    state.theme = theme.value; lsSet("wl_theme", state.theme); applyTheme();
+    const langChanged = lang.value !== state.lang;
+    if (langChanged) { state.lang = lang.value; lsSet("wl_lang", state.lang); applyLang(); }
+    if (!VIEW_ONLY && isConfigured()) {
+      const next = { siteTitle: title.value.trim() || DEFAULT_SETTINGS.siteTitle, currencySymbol: cur.value.trim() || DEFAULT_SETTINGS.currencySymbol };
+      if (next.siteTitle !== state.settings.siteTitle || next.currencySymbol !== state.settings.currencySymbol) {
+        saveBtn.disabled = true;
+        const ok = await run(() => dbSaveMeta(next), t("toastSaved"));
+        if (!ok) { saveBtn.disabled = false; return; }
+      }
+    }
+    m.close();
+    if (langChanged) setLanguage(state.lang); else { buildShell(); renderAll(); }
+  };
+  m.footer.append(el("button", { class: "btn", type: "button", onclick: () => m.close() }, t("cancel")), saveBtn);
+}
+
+/* =============================================================================
+   EVENTS
+   ============================================================================= */
+window.addEventListener("offline", () => toast(t("toastOffline"), "info"));
+window.addEventListener("online", () => toast(t("toastOnline"), "success"));
+
+/* =============================================================================
+   INIT
+   ============================================================================= */
+function init() {
+  document.body.classList.toggle("view-only", VIEW_ONLY);
+  applyTheme(); applyLang();
+  buildShell();
+  if (!isConfigured()) { renderAll(); return; }          // friendly setup banner, no crash
+  try { dbInit(); dbSubscribeAll(); }
+  catch (e) { console.error(e); state.dbError = e.message || String(e); Object.keys(state.loaded).forEach((k) => { state.loaded[k] = true; }); }
+  renderAll();
+}
+init();
+</script>
+
+<style>
+:root{
+  --bg:#f6f7fb; --surface:#fff; --surface2:#f0f2f8; --text:#1b1f2a; --muted:#667085; --border:#e4e7ec;
+  --primary:#6366f1; --primary-ink:#fff; --danger:#e5484d; --success:#16a34a; --warning:#f59e0b;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 6px 20px rgba(16,24,40,.07); --radius:14px;
+  color-scheme:light;
+}
+html[data-theme="dark"]{
+  --bg:#0e1118; --surface:#171b26; --surface2:#1f2431; --text:#e8eaf1; --muted:#98a2b3; --border:#2a3042;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35); color-scheme:dark;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;font-family:Inter,"Hind Siliguri",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);line-height:1.5;font-size:15px;transition:background .2s,color .2s}
+body.modal-open{overflow:hidden}
+h1,h2,h3,h4{margin:0;line-height:1.25}
+h4{font-size:14px;margin:14px 0 8px}
+p{margin:0 0 8px}
+a{color:var(--primary)}
+code{font-size:12px;word-break:break-all}
+hr{border:0;border-top:1px solid var(--border);margin:16px 0}
+[hidden]{display:none!important}
+.muted{color:var(--muted)} .small{font-size:12.5px} .pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.warn-text{color:var(--danger);font-weight:600}
+
+/* topbar */
+.topbar{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
+.topbar-in{max-width:1200px;margin:0 auto;padding:10px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.brand{font-size:19px;font-weight:700;display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 auto}
+.brand span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.actions{display:flex;gap:4px;align-items:center;margin-left:auto}
+.pill{background:var(--surface2);border:1px solid var(--border);padding:2px 10px;border-radius:999px;font-size:12px;color:var(--muted)}
+.container{max-width:1200px;margin:0 auto;padding:16px 14px 110px}
+
+/* buttons / inputs */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:9px 14px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);font:inherit;font-weight:500;cursor:pointer;text-decoration:none;transition:transform .08s,background .15s,border-color .15s}
+.btn:hover{background:var(--surface2)} .btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.6;cursor:not-allowed}
+.btn-primary{background:var(--primary);border-color:var(--primary);color:var(--primary-ink)}
+.btn-primary:hover{background:color-mix(in srgb,var(--primary) 88%,#000)}
+.btn-danger{background:var(--danger);border-color:var(--danger);color:#fff}
+.btn-danger:hover{background:color-mix(in srgb,var(--danger) 88%,#000)}
+.btn-danger-ghost{color:var(--danger)}
+.btn-ghost{border-color:transparent;background:transparent;padding:8px 10px}
+.btn-sm{padding:6px 10px;font-size:13px;border-radius:8px}
+.icon-btn{display:inline-flex;align-items:center;justify-content:center;min-width:36px;height:36px;border-radius:10px;border:1px solid transparent;background:transparent;color:var(--text);cursor:pointer;font:inherit;font-size:15px}
+.icon-btn:hover{background:var(--surface2)} .icon-btn.danger:hover{background:color-mix(in srgb,var(--danger) 15%,transparent)}
+.lang-btn{font-size:13px;font-weight:600;border-color:var(--border)}
+.input{width:100%;padding:9px 11px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);font:inherit;min-height:40px}
+textarea.input{resize:vertical}
+.input:focus,.btn:focus-visible,.icon-btn:focus-visible,.card:focus-visible,.chip:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
+.color-input{width:100%;height:42px;padding:2px;border-radius:10px;border:1px solid var(--border);background:var(--surface)}
+.checkbox{width:20px;height:20px}
+.field{display:flex;flex-direction:column;gap:5px;margin-bottom:10px}
+.check-field{flex-direction:row;align-items:center;gap:8px}
+.lbl{font-size:13px;font-weight:600;color:var(--muted)}
+.btn .lbl{color:inherit;font-weight:500;font-size:14px}
+.hint{color:var(--muted)}
+.hide-sm{display:none}
+@media(min-width:760px){.hide-sm{display:inline-flex}}
+@media(max-width:700px){.actions .btn .lbl{display:none}.actions .btn{padding:8px}.fab .lbl{display:none}}
+
+/* dashboard */
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+@media(min-width:760px){.stats{grid-template-columns:repeat(4,1fr)}.stats-sm{grid-template-columns:repeat(3,1fr)}}
+.stats-sm{grid-template-columns:repeat(3,1fr);margin-bottom:6px}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;box-shadow:var(--shadow);min-width:0}
+.stat-label{font-size:12.5px;color:var(--muted);font-weight:600}
+.stat-value{font-size:21px;font-weight:700;margin-top:2px;overflow-wrap:anywhere}
+.stat-sub{font-size:12px;color:var(--muted);margin-top:2px}
+.stat-ok .stat-value{color:var(--success)} .stat-warn .stat-value{color:var(--warning)}
+.group-totals{margin-top:12px}
+.gt-row{display:flex;gap:8px;overflow-x:auto;padding:6px 2px 8px;scrollbar-width:thin}
+.gt{flex:0 0 auto;min-width:150px;text-align:left;display:flex;flex-direction:column;gap:1px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--c);border-radius:12px;padding:8px 12px;cursor:pointer;color:var(--text);font:inherit}
+.gt:hover{background:var(--surface2)} .gt-name{font-weight:600;font-size:13.5px} .gt-total{font-weight:700} .gt-sub{font-size:11.5px;color:var(--muted)}
+
+/* groups */
+#groupBar{margin-top:14px}
+.chips{display:flex;gap:8px;overflow-x:auto;padding:4px 2px 8px;scrollbar-width:thin}
+.chip{flex:0 0 auto;display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:999px;border:1px solid var(--border);background:var(--surface);color:var(--text);font:inherit;font-weight:500;cursor:pointer;white-space:nowrap}
+.chip:hover{border-color:var(--c)}
+.chip.active{background:var(--c);border-color:var(--c);color:#fff}
+.chip-count{font-size:12px;opacity:.75;background:color-mix(in srgb,currentColor 14%,transparent);padding:0 7px;border-radius:999px}
+.chip-add{border-style:dashed;color:var(--muted)}
+.group-actions{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 6px}
+
+/* filters */
+.filters{margin-top:10px;display:flex;flex-direction:column;gap:8px}
+.filter-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+@media(min-width:760px){.filters{flex-direction:row;flex-wrap:wrap;align-items:center}.search{flex:1 1 240px;width:auto}.filter-row{display:flex;flex:2 1 520px}.filter-row .input{min-width:130px}#resultCount{width:100%}}
+
+/* cards */
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px}
+@media(min-width:760px){.grid{grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px}}
+.card{position:relative;background:var(--surface);border:1px solid var(--border);border-top:3px solid var(--c,var(--primary));border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow);cursor:pointer;display:flex;flex-direction:column;transition:transform .15s,box-shadow .15s;animation:pop .25s ease both}
+.card:hover{transform:translateY(-2px)}
+.card.status-bought{opacity:.85} .card.status-skipped{opacity:.6}
+.card-media{position:relative;aspect-ratio:4/3;background:var(--surface2)}
+.imgbox{width:100%;height:100%} .imgbox img{width:100%;height:100%;object-fit:cover;display:block}
+.img-ph{width:100%;height:100%;min-height:80px;display:flex;align-items:center;justify-content:center;font-size:34px;background:linear-gradient(135deg,var(--surface2),var(--border));opacity:.9}
+.badge{position:absolute;top:8px;left:8px;font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px;background:#475467;color:#fff}
+.badge.static{position:static;display:inline-block}
+.st-want{background:#2563eb}.st-bought{background:var(--success)}.st-skipped{background:#6b7280}
+.prio{position:absolute;top:8px;right:8px;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;background:var(--surface);border:1px solid var(--border)}
+.prio-high.prio,.prio-b.prio-high{color:#b42318;background:#fee4e2;border-color:#fecdca}
+.prio-medium.prio,.prio-b.prio-medium{color:#93370d;background:#fef0c7;border-color:#fedf89}
+.prio-low.prio,.prio-b.prio-low{color:#05603a;background:#d1fadf;border-color:#a6f4c5}
+.prio-b{position:static!important;border:1px solid;font-weight:600;font-size:11.5px;padding:2px 9px;border-radius:999px}
+.prio-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:#999}
+.prio-dot.prio-high{background:#ef4444}.prio-dot.prio-medium{background:#f59e0b}.prio-dot.prio-low{background:#22c55e}
+.card-body{padding:10px 12px 12px;display:flex;flex-direction:column;gap:6px;flex:1;min-width:0}
+.card-title{font-size:15px;font-weight:600;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card-meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.tag{font-size:11.5px;padding:2px 8px;border-radius:999px;background:color-mix(in srgb,var(--c,var(--primary)) 16%,transparent);color:var(--text)}
+.tag-soft{background:var(--surface2);color:var(--muted)}
+.card-price{display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
+.price{font-weight:700;font-size:16px}
+.mini-dl{margin:2px 0 0;display:grid;grid-template-columns:auto 1fr;gap:1px 8px;font-size:12px}
+.mini-dl dt{color:var(--muted)} .mini-dl dd{margin:0;overflow-wrap:anywhere}
+.card-actions{display:flex;gap:2px;justify-content:flex-end;padding:0 6px 6px;border-top:1px solid var(--border);padding-top:4px}
+.empty{grid-column:1/-1;text-align:center;padding:40px 16px;background:var(--surface);border:1px dashed var(--border);border-radius:var(--radius)}
+.empty-ico{font-size:44px}.empty h3{margin:8px 0}.empty-actions{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px}
+.fab{position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom));z-index:15;display:inline-flex;align-items:center;gap:8px;padding:13px 18px;border-radius:999px;border:0;background:var(--primary);color:#fff;font:inherit;font-weight:600;box-shadow:0 8px 24px rgba(99,102,241,.45);cursor:pointer}
+.fab .lbl{color:#fff;font-size:14px}.fab-plus{font-size:18px;line-height:1}
+
+/* banners */
+.banner{max-width:1200px;margin:12px auto 0;padding:12px 14px;border-radius:12px;border:1px solid}
+.banner-warn{background:#fffaeb;border-color:#fedf89;color:#93370d}
+.banner-error{background:#fef3f2;border-color:#fecdca;color:#b42318}
+#banner{padding:0 14px}
+
+/* skeleton */
+.skel{background:linear-gradient(90deg,var(--surface2) 25%,var(--border) 50%,var(--surface2) 75%);background-size:200% 100%;animation:shimmer 1.2s infinite;border-radius:10px}
+.skel-card{pointer-events:none}
+@keyframes shimmer{to{background-position:-200% 0}}
+@keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* modal */
+.overlay{position:fixed;inset:0;z-index:50;background:rgba(10,14,25,.55);display:flex;align-items:flex-end;justify-content:center;animation:fade .15s ease}
+.modal{background:var(--surface);color:var(--text);width:100%;max-height:92vh;display:flex;flex-direction:column;border-radius:18px 18px 0 0;box-shadow:0 -10px 40px rgba(0,0,0,.3);animation:slide .2s ease}
+.modal-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px;border-bottom:1px solid var(--border)}
+.modal-head h3{font-size:17px;overflow-wrap:anywhere}
+.modal-body{padding:14px 16px;overflow-y:auto;flex:1;-webkit-overflow-scrolling:touch}
+.modal-foot{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;padding:12px 16px calc(12px + env(safe-area-inset-bottom));border-top:1px solid var(--border)}
+.modal-foot:empty{display:none}
+@media(min-width:640px){
+  .overlay{align-items:center;padding:20px}
+  .modal{border-radius:18px;max-width:560px}.modal.sm{max-width:420px}.modal.lg{max-width:760px}
+}
+@keyframes fade{from{opacity:0}}@keyframes slide{from{transform:translateY(24px);opacity:0}}
+.form-grid{display:grid;grid-template-columns:1fr;gap:0 12px}
+@media(min-width:640px){.form-grid{grid-template-columns:1fr 1fr}.span-2{grid-column:span 2}}
+.span-2{grid-column:1/-1}
+.custom-box{display:grid;grid-template-columns:1fr;gap:0 12px;border-top:1px dashed var(--border);padding-top:10px}
+@media(min-width:640px){.custom-box{grid-template-columns:1fr 1fr}}
+.img-preview{margin:-2px 0 10px;max-width:260px}
+.img-preview .imgbox{aspect-ratio:4/3;border-radius:12px;overflow:hidden;border:1px solid var(--border)}
+.pick-row{display:flex;gap:6px;flex-wrap:wrap;margin:-4px 0 12px}
+.pick{width:36px;height:36px;border-radius:10px;border:1px solid var(--border);background:var(--surface);cursor:pointer;font-size:18px}
+.swatch{border:2px solid var(--surface);box-shadow:0 0 0 1px var(--border)}
+.rows{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}
+.row{display:flex;gap:8px;align-items:center}.row .input{flex:1;min-width:0}
+.field-row{flex-wrap:wrap}.field-row .input{flex:1 1 150px}
+.add-row{margin-top:8px}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap}
+
+/* detail */
+.detail{display:grid;gap:14px;grid-template-columns:1fr}
+@media(min-width:640px){.detail{grid-template-columns:280px 1fr}}
+.detail-img{aspect-ratio:4/3;border-radius:14px;overflow:hidden;background:var(--surface2);border:1px solid var(--border)}
+.detail-main{display:flex;flex-direction:column;gap:10px}
+.info-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.info{background:var(--surface2);border-radius:10px;padding:8px 10px}.info-v{font-weight:600;overflow-wrap:anywhere}
+.section{margin-top:12px}
+.dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0}.dl dt{color:var(--muted)}.dl dd{margin:0;overflow-wrap:anywhere}
+.history{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
+.history li{display:flex;justify-content:space-between;gap:10px;background:var(--surface2);padding:6px 10px;border-radius:8px}
+
+/* budget table */
+.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px}
+.tbl{width:100%;border-collapse:collapse;font-size:13.5px}
+.tbl th,.tbl td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}
+.tbl td:nth-child(2){white-space:normal;min-width:140px}
+.tbl th{background:var(--surface2);font-size:12px;color:var(--muted)}.tbl tr:last-child td{border-bottom:0}
+
+/* toasts */
+#toasts{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(84px + env(safe-area-inset-bottom));z-index:100;display:flex;flex-direction:column;gap:8px;width:min(92vw,420px);pointer-events:none}
+.toast{pointer-events:auto;padding:11px 14px;border-radius:12px;background:#1f2937;color:#fff;box-shadow:0 8px 24px rgba(0,0,0,.3);font-size:14px;animation:slide .2s ease;transition:opacity .3s}
+.toast-success{background:#15803d}.toast-error{background:#b42318}.toast.out{opacity:0}
+
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* print / save as PDF */
+@media print{
+  html[data-theme]{--bg:#fff;--surface:#fff;--surface2:#f4f4f5;--text:#000;--muted:#444;--border:#cfcfcf;--shadow:none}
+  body{background:#fff;font-size:12px}
+  .no-print,.actions,.fab,#filterBar,.overlay,#toasts,.card-actions,.chip-add,.group-actions,.pill{display:none!important}
+  .topbar{position:static;border:0}.container{padding:0}
+  .grid{grid-template-columns:repeat(3,1fr)!important;gap:8px}
+  .card{break-inside:avoid;box-shadow:none;animation:none}
+  .chips,.gt-row{flex-wrap:wrap;overflow:visible}
+  .stats{grid-template-columns:repeat(4,1fr)}
+}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts" aria-live="polite"></div>
+<noscript>This app needs JavaScript.</noscript>
+</body>
+</html>
